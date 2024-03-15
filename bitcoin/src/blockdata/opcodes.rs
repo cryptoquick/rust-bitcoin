@@ -250,8 +250,8 @@ all_opcodes! {
     OP_NOP1 => 0xb0, "Does nothing.";
     OP_CLTV => 0xb1, "<https://github.com/bitcoin/bips/blob/master/bip-0065.mediawiki>";
     OP_CSV => 0xb2, "<https://github.com/bitcoin/bips/blob/master/bip-0112.mediawiki>";
-    OP_NOP4 => 0xb3, "Does nothing.";
-    OP_NOP5 => 0xb4, "Does nothing.";
+    OP_CHECKTEMPLATEVERIFY => 0xb3, "<https://github.com/bitcoin/bips/blob/master/bip-0119.mediawiki>";
+    OP_CHECKSIGFROMSTACKVERIFY => 0xb4, "<https://github.com/bitcoin/bips/pull/1535>";
     OP_NOP6 => 0xb5, "Does nothing.";
     OP_NOP7 => 0xb6, "Does nothing.";
     OP_NOP8 => 0xb7, "Does nothing.";
@@ -757,8 +757,8 @@ mod tests {
         roundtrip!(unique, OP_NOP1);
         roundtrip!(unique, OP_CLTV);
         roundtrip!(unique, OP_CSV);
-        roundtrip!(unique, OP_NOP4);
-        roundtrip!(unique, OP_NOP5);
+        roundtrip!(unique, OP_CHECKTEMPLATEVERIFY);
+        roundtrip!(unique, OP_CHECKSIGFROMSTACKVERIFY);
         roundtrip!(unique, OP_NOP6);
         roundtrip!(unique, OP_NOP7);
         roundtrip!(unique, OP_NOP8);
