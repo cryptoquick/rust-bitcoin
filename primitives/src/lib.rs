@@ -35,6 +35,8 @@ pub mod _export {
     }
 }
 
+#[cfg(feature = "bip360")]
+pub mod attestation;
 pub mod block;
 pub mod locktime;
 pub mod merkle_tree;
