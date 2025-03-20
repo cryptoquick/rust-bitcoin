@@ -192,6 +192,14 @@ crate::internal_macros::define_extension_trait! {
                 && self.as_bytes()[1] == OP_PUSHBYTES_20.to_u8()
         }
 
+        /// Checks whether a script pubkey is a P2QRH output.
+        #[inline]
+        fn is_p2qrh(&self) -> bool {
+            self.len() == 34
+                && self.witness_version() == Some(WitnessVersion::V2)
+                && self.as_bytes()[1] == OP_PUSHBYTES_32.to_u8()
+        }
+
         /// Checks whether a script pubkey is a P2TR output.
         #[inline]
         fn is_p2tr(&self) -> bool {

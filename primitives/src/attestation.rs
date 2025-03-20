@@ -15,7 +15,7 @@ use internals::wrap_debug::WrapDebug;
 
 use crate::prelude::Vec;
 
-/// The Attestation is the data used to unlock bitcoin since the [QuBit upgrade].
+/// The Attestation is the data used to unlock bitcoin since the `[QuBit upgrade]`.
 ///
 /// Can be logically seen as an array of bytestrings, i.e. `Vec<Vec<u8>>`, and it is serialized on the wire
 /// in that format. You can convert between this type and `Vec<Vec<u8>>` by using [`Attestation::from_slice`]
@@ -100,15 +100,11 @@ impl Attestation {
 
     /// Convenience method to create an array of byte-arrays from this attestation.
     #[inline]
-    pub fn to_vec(&self) -> Vec<Vec<u8>> {
-        self.iter().map(<[u8]>::to_vec).collect()
-    }
+    pub fn to_vec(&self) -> Vec<Vec<u8>> { self.iter().map(<[u8]>::to_vec).collect() }
 
     /// Returns `true` if the attestation contains no element.
     #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.attestation_elements == 0
-    }
+    pub fn is_empty(&self) -> bool { self.attestation_elements == 0 }
 
     /// Returns a struct implementing [`Iterator`].
     #[must_use = "iterators are lazy and do nothing unless consumed"]
@@ -119,9 +115,7 @@ impl Attestation {
 
     /// Returns the number of elements this attestation holds.
     #[inline]
-    pub fn len(&self) -> usize {
-        self.attestation_elements
-    }
+    pub fn len(&self) -> usize { self.attestation_elements }
 
     /// Returns the number of bytes this attestation contributes to a transactions total size.
     pub fn size(&self) -> usize {
@@ -180,9 +174,7 @@ impl Attestation {
 
     /// Returns the last element in the attestation, if any.
     #[inline]
-    pub fn last(&self) -> Option<&[u8]> {
-        self.get_back(0)
-    }
+    pub fn last(&self) -> Option<&[u8]> { self.get_back(0) }
 
     /// Retrieves an element from the end of the attestation by its reverse index.
     ///
@@ -284,9 +276,7 @@ impl Index<usize> for Attestation {
 
     #[track_caller]
     #[inline]
-    fn index(&self, index: usize) -> &Self::Output {
-        self.get(index).expect("out of bounds")
-    }
+    fn index(&self, index: usize) -> &Self::Output { self.get(index).expect("out of bounds") }
 }
 
 impl<'a> Iterator for Iter<'a> {
@@ -318,9 +308,7 @@ impl<'a> IntoIterator for &'a Attestation {
     type Item = &'a [u8];
 
     #[inline]
-    fn into_iter(self) -> Self::IntoIter {
-        self.iter()
-    }
+    fn into_iter(self) -> Self::IntoIter { self.iter() }
 }
 
 // Serde keep backward compatibility with old Vec<Vec<u8>> format
@@ -389,9 +377,8 @@ impl<'de> serde::Deserialize<'de> for Attestation {
                                 ),
                             }
                         }
-                        E::OddLengthString(ref e) => {
-                            de::Error::invalid_length(e.length(), &"an even length string")
-                        }
+                        E::OddLengthString(ref e) =>
+                            de::Error::invalid_length(e.length(), &"an even length string"),
                     })?;
                     ret.push(vec);
                 }
@@ -410,37 +397,27 @@ impl<'de> serde::Deserialize<'de> for Attestation {
 
 impl From<Vec<Vec<u8>>> for Attestation {
     #[inline]
-    fn from(vec: Vec<Vec<u8>>) -> Self {
-        Attestation::from_slice(&vec)
-    }
+    fn from(vec: Vec<Vec<u8>>) -> Self { Attestation::from_slice(&vec) }
 }
 
 impl From<&[&[u8]]> for Attestation {
     #[inline]
-    fn from(slice: &[&[u8]]) -> Self {
-        Attestation::from_slice(slice)
-    }
+    fn from(slice: &[&[u8]]) -> Self { Attestation::from_slice(slice) }
 }
 
 impl From<&[Vec<u8>]> for Attestation {
     #[inline]
-    fn from(slice: &[Vec<u8>]) -> Self {
-        Attestation::from_slice(slice)
-    }
+    fn from(slice: &[Vec<u8>]) -> Self { Attestation::from_slice(slice) }
 }
 
 impl From<Vec<&[u8]>> for Attestation {
     #[inline]
-    fn from(vec: Vec<&[u8]>) -> Self {
-        Attestation::from_slice(&vec)
-    }
+    fn from(vec: Vec<&[u8]>) -> Self { Attestation::from_slice(&vec) }
 }
 
 impl Default for Attestation {
     #[inline]
-    fn default() -> Self {
-        Self::new()
-    }
+    fn default() -> Self { Self::new() }
 }
 
 #[cfg(feature = "arbitrary")]

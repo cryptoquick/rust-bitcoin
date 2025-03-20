@@ -47,11 +47,14 @@ hashes::hash_newtype! {
     /// looks similar to this one also being SHA256, however, they hash semantically different
     /// scripts and have reversed representations, so this type cannot be used for both.
     pub struct WScriptHash(sha256::Hash);
+
+    /// Quantum Resistant Hash256 version of a Bitcoin Script bytecode hash.
+    pub struct QrhHash(sha256::Hash);
 }
 
-hashes::impl_hex_for_newtype!(ScriptHash, WScriptHash);
+hashes::impl_hex_for_newtype!(ScriptHash, WScriptHash, QrhHash);
 #[cfg(feature = "serde")]
-hashes::impl_serde_for_newtype!(ScriptHash, WScriptHash);
+hashes::impl_serde_for_newtype!(ScriptHash, WScriptHash, QrhHash);
 
 impl ScriptHash {
     /// Constructs a new `ScriptHash` after first checking the script size.

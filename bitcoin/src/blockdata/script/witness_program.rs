@@ -11,6 +11,7 @@ use core::convert::Infallible;
 use core::fmt;
 
 use internals::array_vec::ArrayVec;
+use primitives::script::QrhHash;
 use secp256k1::{Secp256k1, Verification};
 
 use super::witness_version::WitnessVersion;
@@ -75,6 +76,11 @@ impl WitnessProgram {
         WitnessProgram { version: WitnessVersion::V1, program: ArrayVec::from_slice(&program) }
     }
 
+    /// Constructs a new [`WitnessProgram`] from a 32 byte serialized quantum resistant hash256.
+    fn new_p2qrh(program: [u8; 32]) -> Self {
+        WitnessProgram { version: WitnessVersion::V3, program: ArrayVec::from_slice(&program) }
+    }
+
     /// Constructs a new [`WitnessProgram`] from `pk` for a P2WPKH output.
     pub fn p2wpkh(pk: CompressedPublicKey) -> Self {
         let hash = pk.wpubkey_hash();
@@ -113,6 +119,11 @@ impl WitnessProgram {
         WitnessProgram { version: WitnessVersion::V1, program: ArrayVec::from_slice(&P2A_PROGRAM) }
     }
 
+    /// Constructs a new [`WitnessProgram`] from `hash` for a P2QRH output.
+    pub fn p2qrh_from_hash(hash: QrhHash) -> Self {
+        WitnessProgram::new_p2qrh(hash.to_byte_array())
+    }
+
     /// Returns the witness program version.
     pub fn version(&self) -> WitnessVersion { self.version }
 
@@ -141,6 +152,11 @@ impl WitnessProgram {
     pub fn is_p2a(&self) -> bool {
         self.version == WitnessVersion::V1 && self.program == P2A_PROGRAM
     }
+
+    /// Returns true if this is a pay to quantum resistant hash output.
+    pub fn is_p2qrh(&self) -> bool {
+        self.version == WitnessVersion::V3 && self.program.len() == 32
+    }
 }
 
 /// Witness program error.
@@ -162,10 +178,12 @@ impl fmt::Display for Error {
         use Error::*;
 
         match *self {
-            InvalidLength(len) =>
-                write!(f, "witness program must be between 2 and 40 bytes: length={}", len),
-            InvalidSegwitV0Length(len) =>
-                write!(f, "a v0 witness program must be either 20 or 32 bytes: length={}", len),
+            InvalidLength(len) => {
+                write!(f, "witness program must be between 2 and 40 bytes: length={}", len)
+            }
+            InvalidSegwitV0Length(len) => {
+                write!(f, "a v0 witness program must be either 20 or 32 bytes: length={}", len)
+            }
         }
     }
 }
@@ -188,13 +206,15 @@ mod tests {
     #[test]
     fn witness_program_is_too_short() {
         let arbitrary_bytes = [0x00; MIN_SIZE - 1];
-        assert!(WitnessProgram::new(WitnessVersion::V15, &arbitrary_bytes).is_err()); // Arbitrary version
+        assert!(WitnessProgram::new(WitnessVersion::V15, &arbitrary_bytes).is_err());
+        // Arbitrary version
     }
 
     #[test]
     fn witness_program_is_too_long() {
         let arbitrary_bytes = [0x00; MAX_SIZE + 1];
-        assert!(WitnessProgram::new(WitnessVersion::V15, &arbitrary_bytes).is_err()); // Arbitrary version
+        assert!(WitnessProgram::new(WitnessVersion::V15, &arbitrary_bytes).is_err());
+        // Arbitrary version
     }
 
     #[test]
@@ -222,5 +242,20 @@ mod tests {
         assert!(WitnessProgram::new(WitnessVersion::V1, &arbitrary_bytes)
             .expect("valid witness program")
             .is_p2tr());
+    }
+
+    #[test]
+    fn valid_v3_witness_programs() {
+        let arbitrary_bytes = [0x00; 32];
+        assert!(WitnessProgram::new(WitnessVersion::V3, &arbitrary_bytes)
+            .expect("valid witness program")
+            .is_p2qrh());
+    }
+
+    #[test]
+    fn p2qrh_from_hash() {
+        let hash = QrhHash::from_byte_array([0x00; 32]);
+        let witness_program = WitnessProgram::p2qrh_from_hash(hash);
+        assert!(witness_program.is_p2qrh());
     }
 }
