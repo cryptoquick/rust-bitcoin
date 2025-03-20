@@ -1,3 +1,6 @@
+use bitcoin::crypto::qubit::{
+    generate_sphincs_signing_key, generate_sphincs_verifying_key, sign_sphincs, verify_signature,
+};
 use bitcoin::hashes::sha256;
 use bitcoin::qubit::{
     Attestation, KeyTypeBitmask, P2QRHTemplate, Signature as QubitSignature, SignatureAlgorithm,
@@ -133,4 +136,116 @@ fn generate_deterministic_ml_dsa_signature(message: &[u8]) -> Vec<u8> {
     }
 
     signature
+}
+
+#[test]
+fn test_sphincs_key_generation() {
+    // Create a fixed seed for deterministic testing
+    let seed = [
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e,
+        0x1f, 0x20,
+    ];
+
+    // Generate signing key from the seed
+    let signing_key = generate_sphincs_signing_key(&seed).unwrap();
+
+    // Verify the signing key is not empty
+    assert!(!signing_key.is_empty());
+
+    // Generate verifying key from the signing key
+    let verifying_key = generate_sphincs_verifying_key(&signing_key).unwrap();
+
+    // Verify the verifying key is not empty
+    assert!(!verifying_key.is_empty());
+}
+
+#[test]
+fn test_sphincs_sign_verify() {
+    // Create a fixed seed for deterministic testing
+    let seed = [
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e,
+        0x1f, 0x20,
+    ];
+
+    // Generate signing key from the seed
+    let signing_key = generate_sphincs_signing_key(&seed).unwrap();
+
+    // Generate verifying key from the signing key
+    let verifying_key = generate_sphincs_verifying_key(&signing_key).unwrap();
+
+    // Create a message to sign
+    let message = b"This is a test message";
+
+    // Sign the message
+    let signature = sign_sphincs(&signing_key, message).unwrap();
+
+    // Verify the signature's algorithm is SPHINCS+
+    assert_eq!(signature.algorithm, SignatureAlgorithm::Sphincs);
+
+    // Verify the signature
+    assert!(verify_signature(&signature, &verifying_key, message));
+
+    // Verify that the signature fails with a different message
+    let wrong_message = b"This is a different message";
+    assert!(!verify_signature(&signature, &verifying_key, wrong_message));
+}
+
+#[test]
+fn test_p2qrh_with_real_sphincs() {
+    // Create a seed for the SPHINCS+ key
+    let seed = [
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e,
+        0x1f, 0x20,
+    ];
+
+    // Generate real SPHINCS+ keypair
+    let sphincs_sk = generate_sphincs_signing_key(&seed).unwrap();
+    let sphincs_pubkey = generate_sphincs_verifying_key(&sphincs_sk).unwrap();
+
+    // Create a simulated ML-DSA public key
+    let ml_dsa_pubkey = vec![
+        0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+        0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+        0x88, 0x03,
+    ];
+
+    // Create a P2QRH attestation with both keys
+    let bitmask =
+        KeyTypeBitmask::new(&[SignatureAlgorithm::Sphincs, SignatureAlgorithm::Dilithium]);
+    let attestation = Attestation::new(
+        bitmask,
+        vec![
+            (SignatureAlgorithm::Sphincs, sphincs_pubkey.clone()),
+            (SignatureAlgorithm::Dilithium, ml_dsa_pubkey.clone()),
+        ],
+    );
+
+    // Create a P2QRH template and generate the scriptPubKey
+    let template = P2QRHTemplate::new(&attestation);
+    let script_pubkey = template.script_pubkey();
+
+    // Verify script_pubkey is in the expected format for SegWit v3
+    let script_str = script_pubkey.to_string();
+    assert!(script_str.starts_with("OP_PUSHNUM_3 OP_PUSHBYTES_32"));
+
+    // Sign a message with SPHINCS+
+    let message = b"Transaction to sign";
+    let sphincs_signature = sign_sphincs(&sphincs_sk, message).unwrap();
+
+    // Verify the signature
+    assert!(verify_signature(&sphincs_signature, &sphincs_pubkey, message));
+
+    // Ensure signature has the right algorithm
+    assert_eq!(sphincs_signature.algorithm, SignatureAlgorithm::Sphincs);
+
+    // Check serialization and deserialization
+    let serialized = sphincs_signature.to_vec();
+    let deserialized = QubitSignature::from_slice(&serialized).unwrap();
+
+    // Verify the deserialized signature
+    assert_eq!(deserialized.algorithm, SignatureAlgorithm::Sphincs);
+    assert!(verify_signature(&deserialized, &sphincs_pubkey, message));
 }
