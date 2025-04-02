@@ -15,11 +15,13 @@ rust-version = "1.63.0"
 exclude = ["tests", "contrib"]
 
 [features]
-default = ["std"]
+# default = ["std"]
+default = ["bip360"]
 std = ["alloc", "hashes/std", "hex/std", "internals/std", "units/std"]
 alloc = ["hashes/alloc", "hex/alloc", "internals/alloc", "units/alloc"]
 serde = ["dep:serde", "hashes/serde", "internals/serde", "units/serde", "alloc"]
 arbitrary = ["dep:arbitrary", "units/arbitrary"]
+bip360 = ["std"]
 
 [dependencies]
 hashes = { package = "bitcoin_hashes", version = "0.16.0", default-features = false, features = ["hex"] }

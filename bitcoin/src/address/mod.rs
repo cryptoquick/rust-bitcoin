@@ -93,6 +93,8 @@ pub enum AddressType {
     P2tr,
     /// Pay to anchor.
     P2a,
+    /// Pay to quantum resistant hash.
+    P2qrh,
 }
 
 impl fmt::Display for AddressType {
@@ -104,6 +106,7 @@ impl fmt::Display for AddressType {
             AddressType::P2wsh => "p2wsh",
             AddressType::P2tr => "p2tr",
             AddressType::P2a => "p2a",
+            AddressType::P2qrh => "p2qrh",
         })
     }
 }
@@ -118,6 +121,7 @@ impl FromStr for AddressType {
             "p2wsh" => Ok(AddressType::P2wsh),
             "p2tr" => Ok(AddressType::P2tr),
             "p2a" => Ok(AddressType::P2a),
+            "p2qrh" => Ok(AddressType::P2qrh),
             _ => Err(UnknownAddressTypeError(s.to_owned())),
         }
     }
@@ -598,6 +602,8 @@ impl Address {
                     Some(AddressType::P2tr)
                 } else if program.is_p2a() {
                     Some(AddressType::P2a)
+                } else if program.is_p2qrh() {
+                    Some(AddressType::P2qrh)
                 } else {
                     None
                 },
@@ -781,6 +787,13 @@ impl Address {
             P2pkh { ref hash, network: _ } => hash.as_ref(),
             Segwit { ref program, hrp: _ } => program.program().as_bytes(),
         }
+    }
+
+    /// Creates a P2QRH (Pay to Quantum Resistant Hash) address from a 32-byte hash.
+    pub fn p2qrh_from_hash(hash: [u8; 32], hrp: impl Into<KnownHrp>) -> Address {
+        let program = WitnessProgram::new(WitnessVersion::V2, &hash)
+            .expect("32 bytes is a valid program length");
+        Address::from_witness_program(program, hrp)
     }
 }
 

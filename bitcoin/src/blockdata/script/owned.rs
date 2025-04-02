@@ -6,10 +6,11 @@ use core::ops::Deref;
 use hex::FromHex;
 use internals::ToU64 as _;
 
-use super::{opcode_to_verify, Builder, Instruction, PushBytes, ScriptExtPriv as _};
+use super::{opcode_to_verify, Builder, Instruction, PushBytes, ScriptExt, ScriptExtPriv as _};
 use crate::opcodes::all::*;
 use crate::opcodes::{self, Opcode};
 use crate::prelude::Vec;
+use crate::script::witness_version::WitnessVersion;
 
 #[rustfmt::skip]            // Keep public re-exports separate.
 #[doc(inline)]
@@ -78,6 +79,22 @@ crate::internal_macros::define_extension_trait! {
         /// `Builder` if you're creating the script from scratch or if you want to push `OP_VERIFY`
         /// multiple times.
         fn scan_and_push_verify(&mut self) { self.push_verify(self.last_opcode()); }
+
+        /// Checks whether a script pubkey is a P2WPKH output.
+        #[inline]
+        fn is_p2wpkh(&self) -> bool {
+            self.len() == 22
+                && self.witness_version() == Some(WitnessVersion::V0)
+                && self.as_bytes()[1] == OP_PUSHBYTES_20.to_u8()
+        }
+
+        /// Checks whether a script pubkey is a P2QRH output.
+        #[inline]
+        fn is_p2qrh(&self) -> bool {
+            self.len() == 34
+                && self.witness_version() == Some(WitnessVersion::V3)
+                && self.as_bytes()[1] == OP_PUSHBYTES_32.to_u8()
+        }
     }
 }
 

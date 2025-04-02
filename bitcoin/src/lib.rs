@@ -111,6 +111,7 @@ pub mod network;
 pub mod policy;
 pub mod pow;
 pub mod psbt;
+pub mod qubit;
 pub mod sign_message;
 pub mod taproot;
 
