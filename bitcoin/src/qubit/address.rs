@@ -6,9 +6,12 @@
 
 use core::fmt;
 
+use bitcoinpqc::Algorithm as PqcAlgorithm;
+
+use super::KeyAlgorithm;
 use crate::address::{Address, KnownHrp};
 use crate::crypto::key::TweakedPublicKey;
-use crate::qubit::{Attestation, KeyTypeBitmask, P2QRHTemplate, SignatureAlgorithm};
+use crate::qubit::{Attestation, KeyTypeBitmask, P2QRHTemplate};
 use crate::XOnlyPublicKey;
 
 /// Possible human-readable parts for P2QRH addresses
@@ -79,16 +82,16 @@ impl QubitAddress {
     pub fn script_pubkey(&self) -> crate::ScriptBuf { self.address.script_pubkey() }
 
     /// Checks if the bitmask has the specified algorithm enabled.
-    pub fn has_algorithm(&self, algorithm: SignatureAlgorithm) -> bool {
-        self.attestation.key_type_bitmask.is_algorithm_enabled(algorithm)
+    pub fn has_algorithm(&self, algorithm: PqcAlgorithm) -> bool {
+        self.attestation.key_type_bitmask.is_algorithm_enabled(KeyAlgorithm::PostQuantum(algorithm))
     }
 
     /// Gets the public key for a specific algorithm.
-    pub fn public_key_for_algorithm(&self, algorithm: SignatureAlgorithm) -> Option<&[u8]> {
+    pub fn public_key_for_algorithm(&self, algorithm: PqcAlgorithm) -> Option<&[u8]> {
         self.attestation
             .public_keys
             .iter()
-            .find(|(algo, _)| *algo == algorithm)
+            .find(|(algo, _)| *algo == KeyAlgorithm::PostQuantum(algorithm))
             .map(|(_, pubkey)| pubkey.as_slice())
     }
 }
@@ -100,7 +103,7 @@ impl fmt::Display for QubitAddress {
 /// A builder to create a P2QRH address from multiple quantum algorithm public keys.
 pub struct QubitAddressBuilder {
     /// Map of algorithm to public key
-    keys: Vec<(SignatureAlgorithm, Vec<u8>)>,
+    keys: Vec<(PqcAlgorithm, Vec<u8>)>,
 }
 
 impl QubitAddressBuilder {
@@ -108,7 +111,7 @@ impl QubitAddressBuilder {
     pub fn new() -> Self { QubitAddressBuilder { keys: Vec::new() } }
 
     /// Adds a public key for a specific quantum algorithm.
-    pub fn add_key(mut self, algorithm: SignatureAlgorithm, public_key: Vec<u8>) -> Self {
+    pub fn add_key(mut self, algorithm: PqcAlgorithm, public_key: Vec<u8>) -> Self {
         self.keys.push((algorithm, public_key));
         self
     }
@@ -116,11 +119,17 @@ impl QubitAddressBuilder {
     /// Builds a P2QRH address for the given network.
     pub fn build(self, hrp: KnownHrp) -> QubitAddress {
         // Create bitmask based on what algorithms are present
-        let algorithms: Vec<SignatureAlgorithm> = self.keys.iter().map(|(algo, _)| *algo).collect();
+        let algorithms: Vec<KeyAlgorithm> =
+            self.keys.iter().map(|(algo, _)| KeyAlgorithm::PostQuantum(*algo)).collect();
         let bitmask = KeyTypeBitmask::new(&algorithms);
 
         // Create attestation
-        let attestation = Attestation::new(bitmask, self.keys);
+        let attestation_keys: Vec<(KeyAlgorithm, Vec<u8>)> = self
+            .keys
+            .iter()
+            .map(|(algo, key)| (KeyAlgorithm::PostQuantum(*algo), key.clone()))
+            .collect();
+        let attestation = Attestation::new(bitmask, attestation_keys);
 
         // Create address
         QubitAddress::new(attestation, hrp)
@@ -142,25 +151,25 @@ mod tests {
         let dilithium_pubkey = vec![0x05, 0x06, 0x07, 0x08];
 
         let address = QubitAddressBuilder::new()
-            .add_key(SignatureAlgorithm::Sphincs, sphincs_pubkey.clone())
-            .add_key(SignatureAlgorithm::Dilithium, dilithium_pubkey.clone())
+            .add_key(PqcAlgorithm::SLH_DSA_128S, sphincs_pubkey.clone())
+            .add_key(PqcAlgorithm::ML_DSA_44, dilithium_pubkey.clone())
             .build(KnownHrp::Testnets);
 
         // Verify the address has correct data
-        assert!(address.has_algorithm(SignatureAlgorithm::Sphincs));
-        assert!(address.has_algorithm(SignatureAlgorithm::Dilithium));
-        assert!(!address.has_algorithm(SignatureAlgorithm::Falcon));
+        assert!(address.has_algorithm(PqcAlgorithm::SLH_DSA_128S));
+        assert!(address.has_algorithm(PqcAlgorithm::ML_DSA_44));
+        assert!(!address.has_algorithm(PqcAlgorithm::FN_DSA_512));
 
         // Check public key retrieval
         assert_eq!(
-            address.public_key_for_algorithm(SignatureAlgorithm::Sphincs),
+            address.public_key_for_algorithm(PqcAlgorithm::SLH_DSA_128S),
             Some(sphincs_pubkey.as_slice())
         );
         assert_eq!(
-            address.public_key_for_algorithm(SignatureAlgorithm::Dilithium),
+            address.public_key_for_algorithm(PqcAlgorithm::ML_DSA_44),
             Some(dilithium_pubkey.as_slice())
         );
-        assert_eq!(address.public_key_for_algorithm(SignatureAlgorithm::Falcon), None);
+        assert_eq!(address.public_key_for_algorithm(PqcAlgorithm::FN_DSA_512), None);
 
         // Verify the script_pubkey
         let script = address.script_pubkey();

@@ -13,7 +13,7 @@ use bitcoinpqc::{
     Algorithm as PqcAlgorithm, PqcError, PublicKey as PqcPublicKey, Signature as PqcSignature,
 };
 use io::Write;
-use secp256k1::{Error as SecpError, Message as SecpMessage};
+use secp256k1::{Error as SecpError, Message as SecpMessage, SecretKey};
 
 // Import secp256k1 types for verification
 use crate::key::{PublicKey as SecpPublicKey, Secp256k1};
@@ -251,7 +251,6 @@ impl std::error::Error for VerificationError {
 /// - The signature format is invalid
 /// - The signature verification fails
 /// - The algorithm is not supported
-#[allow(dead_code)]
 pub fn verify_signature(
     sig: &Signature,
     pubkey_bytes: &[u8],
@@ -324,16 +323,61 @@ impl<'a> Arbitrary<'a> for Signature {
 }
 
 #[cfg(test)]
-mod pqc_tests {
+mod tests {
+    use secp256k1::constants::SECP256K1;
+    use secp256k1::SecretKey;
+
     use super::*;
+    use crate::hashes;
 
     #[test]
-    fn test_pqc_verify_signature() {
+    fn test_verify_signature() {
         // Test message
-        let message = b"Test message for PQC verification";
+        let message = b"Test message for signature verification";
 
-        // Test PQC signatures (simulated since we can't easily generate real PQC signatures in tests)
-        // Setup for ML-DSA-44 (Dilithium)
+        // 1. Test Secp256k1 signatures
+        // 1.1 Create a valid Secp256k1 signature
+        let secp = Secp256k1::new();
+        let secret_key = SecretKey::from_slice(&[0x01; 32]).expect("valid key");
+        let public_key = SecpPublicKey::from_private_key(&secp, &secret_key);
+        let pubkey_bytes = public_key.serialize();
+
+        // Hash the message as done in verify_signature
+        let msg_hash = hashes::sha256t::Hash::<TapSighashTag>::hash(message);
+        let secp_msg = SecpMessage::from_digest(msg_hash.to_byte_array());
+
+        // Sign the message
+        let sig = secp.sign_ecdsa(&secp_msg, &secret_key);
+        let signature = Signature::from_secp(&sig);
+
+        // 1.2 Verify the signature - should succeed
+        let result = verify_signature(&signature, &pubkey_bytes, message);
+        assert!(result.is_ok(), "Valid Secp256k1 signature verification failed");
+
+        // 1.3 Verify with wrong public key - should fail
+        let wrong_pubkey = [0x02; 33]; // Incorrect public key
+        let result = verify_signature(&signature, &wrong_pubkey, message);
+        assert!(result.is_err(), "Verification with wrong pubkey should fail");
+        match result {
+            Err(VerificationError::Secp(_)) => {} // Expected error
+            _ => panic!("Unexpected error type"),
+        }
+
+        // 1.4 Verify with modified message - should fail
+        let wrong_message = b"Different message";
+        let result = verify_signature(&signature, &pubkey_bytes, wrong_message);
+        assert!(result.is_err(), "Verification with wrong message should fail");
+
+        // 1.5 Test invalid signature format
+        let mut invalid_sig = signature.clone();
+        invalid_sig.signature_data[0] ^= 0xFF; // Corrupt signature
+        let result = verify_signature(&invalid_sig, &pubkey_bytes, message);
+        assert!(result.is_err(), "Verification with corrupted signature should fail");
+
+        // 2. Test PQC signatures (simulated since we can't easily generate real PQC signatures in tests)
+        // We'll use mocked PQC signatures similar to those in bitcoin/tests/bip_360.rs
+
+        // 2.1 Setup for ML-DSA-44 (Dilithium)
         let pqc_algo = PqcAlgorithm::ML_DSA_44;
         let pqc_pubkey_size = bitcoinpqc::public_key_size(pqc_algo);
         let pqc_sig_size = bitcoinpqc::signature_size(pqc_algo);
@@ -342,11 +386,16 @@ mod pqc_tests {
         let pqc_pubkey = vec![0xD1; pqc_pubkey_size];
         let pqc_sig_data = vec![0xD2; pqc_sig_size];
 
-        // Create PQC Signature instance
+        // Create Signature instance
         let pqc_signature = Signature::new(KeyAlgorithm::PostQuantum(pqc_algo), pqc_sig_data);
 
-        // Since bitcoinpqc::verify will fail with mocked data,
-        // check that the error is properly propagated
+        // 2.2 We can't actually verify a mocked PQC signature in a test without
+        // being able to generate a valid signature/pubkey pair.
+        // Instead, let's test that the API correctly constructs the verification call
+        // and handles errors as expected
+
+        // Since bitcoinpqc::verify likely will fail with mocked data,
+        // we'll just check that the error is properly propagated
         let result = verify_signature(&pqc_signature, &pqc_pubkey, message);
         assert!(result.is_err(), "Verification with mocked PQC data should fail");
 
@@ -355,22 +404,8 @@ mod pqc_tests {
             _ => panic!("Unexpected error type: {:?}", result),
         }
 
-        // Test invalid pubkey size
+        // 2.3 Test invalid pubkey
         let result = verify_signature(&pqc_signature, &[0xFF], message);
         assert!(result.is_err(), "Verification with invalid PQC pubkey should fail");
-
-        // Test another PQC algorithm - SLH-DSA-128S (SPHINCS+)
-        let sphincs_algo = PqcAlgorithm::SLH_DSA_128S;
-        let sphincs_pubkey_size = bitcoinpqc::public_key_size(sphincs_algo);
-        let sphincs_sig_size = bitcoinpqc::signature_size(sphincs_algo);
-
-        let sphincs_pubkey = vec![0xE1; sphincs_pubkey_size];
-        let sphincs_sig_data = vec![0xE2; sphincs_sig_size];
-
-        let sphincs_signature =
-            Signature::new(KeyAlgorithm::PostQuantum(sphincs_algo), sphincs_sig_data);
-
-        let result = verify_signature(&sphincs_signature, &sphincs_pubkey, message);
-        assert!(result.is_err(), "Verification with mocked SPHINCS+ data should fail");
     }
 }

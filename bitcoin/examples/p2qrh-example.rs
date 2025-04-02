@@ -1,7 +1,8 @@
 use bitcoin::hashes::sha256;
 use bitcoin::qubit::{
-    Attestation, KeyTypeBitmask, P2QRHTemplate, Signature as QubitSignature, SignatureAlgorithm,
+    Attestation, KeyAlgorithm, KeyTypeBitmask, P2QRHTemplate, Signature as QubitSignature,
 };
+use bitcoinpqc::Algorithm as PqcAlgorithm;
 
 fn main() {
     println!("P2QRH (Pay to Quantum Resistant Hash) Example");
@@ -33,8 +34,10 @@ fn main() {
     // Step 2: Create a key type bitmask that enables multiple quantum-resistant algorithms
     // As specified in BIP-360, this allows flexibility in algorithm selection
     println!("\n2. Creating key type bitmask for multiple quantum-resistant algorithms");
-    let bitmask =
-        KeyTypeBitmask::new(&[SignatureAlgorithm::Sphincs, SignatureAlgorithm::Dilithium]);
+    let bitmask = KeyTypeBitmask::new(&[
+        KeyAlgorithm::PostQuantum(PqcAlgorithm::SLH_DSA_128S),
+        KeyAlgorithm::PostQuantum(PqcAlgorithm::ML_DSA_44),
+    ]);
     println!("- Enabled algorithms: SPHINCS+, Dilithium");
 
     // Step 3: Create the attestation with public keys for enabled algorithms
@@ -43,8 +46,8 @@ fn main() {
     let attestation = Attestation::new(
         bitmask,
         vec![
-            (SignatureAlgorithm::Sphincs, sphincs_pubkey.clone()),
-            (SignatureAlgorithm::Dilithium, ml_dsa_pubkey.clone()),
+            (KeyAlgorithm::PostQuantum(PqcAlgorithm::SLH_DSA_128S), sphincs_pubkey.clone()),
+            (KeyAlgorithm::PostQuantum(PqcAlgorithm::ML_DSA_44), ml_dsa_pubkey.clone()),
         ],
     );
     println!("- Attestation created successfully");
@@ -76,8 +79,12 @@ fn main() {
     println!("- Created simulated ML-DSA-44 signature: {} bytes", ml_dsa_signature.len());
 
     // Step 7: Create QubitSignatures for both algorithms
-    let sphincs_qsig = QubitSignature::new(SignatureAlgorithm::Sphincs, sphincs_signature);
-    let ml_dsa_qsig = QubitSignature::new(SignatureAlgorithm::Dilithium, ml_dsa_signature);
+    let sphincs_qsig = QubitSignature::new(
+        KeyAlgorithm::PostQuantum(PqcAlgorithm::SLH_DSA_128S),
+        sphincs_signature,
+    );
+    let ml_dsa_qsig =
+        QubitSignature::new(KeyAlgorithm::PostQuantum(PqcAlgorithm::ML_DSA_44), ml_dsa_signature);
 
     println!("\n7. Serializing the signatures");
     let sphincs_serialized = sphincs_qsig.to_vec();
