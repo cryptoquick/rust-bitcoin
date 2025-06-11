@@ -1460,7 +1460,7 @@ mod test {
     use super::*;
     use crate::sighash::{TapSighash, TapSighashTag};
     use crate::{Address, KnownHrp};
-    extern crate serde_json;
+    use serde_json;
 
     #[cfg(feature = "serde")]
     use {
