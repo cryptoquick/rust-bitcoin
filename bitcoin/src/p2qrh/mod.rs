@@ -36,8 +36,10 @@ impl P2qrhScriptBuf {
         let merkle_root_hash_bytes: [u8; 32] = merkle_root.to_byte_array();
         let script = Builder::new()
             .push_opcode(OP_PUSHNUM_3)
-            .push_opcode(OP_PUSHBYTES_32)
+
+            // automatically pre-fixes with OP_PUSHBYTES_32 (as per size of hash)
             .push_slice(&merkle_root_hash_bytes)
+            
             .into_script();
         P2qrhScriptBuf::new(script)
     }
