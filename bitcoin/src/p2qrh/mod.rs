@@ -15,8 +15,19 @@ use crate::blockdata::script::{
     ScriptBuf,
     Builder
 };
-use crate::hashes::Hash;
+use crate::hashes::{Hash, sha256t_hash_newtype};
 use std::ops::{Deref, DerefMut};
+
+// Create a tagged hash type for P2QRH using the "QuantumRoot" tag
+sha256t_hash_newtype! {
+    pub struct QuantumRootTag = hash_str("QuantumRoot");
+
+    /// P2QRH-tagged hash with tag "QuantumRoot".
+    ///
+    /// This is used for computing the merkle root in P2QRH outputs.
+    #[hash_newtype(forward)]
+    pub struct QuantumRootHash(_);
+}
 
 /// A wrapper around ScriptBuf for P2QRH (Pay to Quantum Resistant Hash) scripts.
 pub struct P2qrhScriptBuf {
@@ -30,15 +41,15 @@ impl P2qrhScriptBuf {
     }
     
     /// Generates P2QRH scriptPubKey output
-    /// Only accepts the merkle_root (of type TapNodeHash) since keypath spend is disabled in p2qrh
-    pub fn new_p2qrh(merkle_root: TapNodeHash) -> Self {
+    /// Only accepts the quantum_root (of type TapNodeHash) since keypath spend is disabled in p2qrh
+    pub fn new_p2qrh(quantum_root: TapNodeHash) -> Self {
         // https://github.com/cryptoquick/bips/blob/p2qrh/bip-0360.mediawiki#scriptpubkey
-        let merkle_root_hash_bytes: [u8; 32] = merkle_root.to_byte_array();
+        let quantum_root_hash_bytes: [u8; 32] = quantum_root.to_byte_array();
         let script = Builder::new()
             .push_opcode(OP_PUSHNUM_3)
 
             // automatically pre-fixes with OP_PUSHBYTES_32 (as per size of hash)
-            .push_slice(&merkle_root_hash_bytes)
+            .push_slice(&quantum_root_hash_bytes)
             
             .into_script();
         P2qrhScriptBuf::new(script)
@@ -95,9 +106,13 @@ impl P2qrhBuilder {
     /// Finalizes the P2QRH builder.
     pub fn finalize(self) -> Result<P2qrhSpendInfo, P2qrhError> {
         let node_info: NodeInfo = self.inner.try_into_node_info().unwrap();
+        
+        // From BIP-0360:
+        //  instead of the root of the Merkle tree being hashed together with the internal key in P2QRH the root is hashed by itself using the tag "QuantumRoot".
+        let quantum_root = QuantumRootHash::hash(node_info.node_hash().as_ref());
+        
         Ok(P2qrhSpendInfo {
-            merkle_root: Some(node_info.node_hash()),
-            //script_map: self.inner.script_map().clone(),
+            quantum_root: Some(TapNodeHash::from_byte_array(quantum_root.to_byte_array()))
         })
     }
 
@@ -115,7 +130,7 @@ type ScriptMerkleProofMap = BTreeMap<(ScriptBuf, LeafVersion), BTreeSet<TaprootM
 pub struct P2qrhSpendInfo {
 
     /// The merkle root of the script path.
-    pub merkle_root: Option<TapNodeHash>,
+    pub quantum_root: Option<TapNodeHash>,
 
     /*
     /// Map from (script, leaf_version) to (sets of) [`TaprootMerkleBranch`]. More than one control
