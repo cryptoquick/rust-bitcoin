@@ -7,6 +7,7 @@ use crate::taproot::{
     NodeInfo,
     LeafVersion,
     TapNodeHash,
+    TaprootBuilderError,
     TAPROOT_CONTROL_BASE_SIZE,
     TAPROOT_CONTROL_NODE_SIZE
 };
@@ -90,6 +91,18 @@ impl P2qrhBuilder {
         }
     }
 
+    /// Adds a leaf with standard TapScript version to the P2QRH builder.
+    pub fn add_leaf(
+        self,
+        depth: u8,
+        script: ScriptBuf
+    ) -> Result<Self, P2qrhError> {
+        match self.inner.add_leaf_with_ver(depth, script, LeafVersion::TapScript) {
+            Ok(builder) => Ok(Self { inner: builder }),
+            Err(_) => Err(P2qrhError::LeafAdditionError)
+        }
+    }
+
     /// Adds a leaf to the P2QRH builder.
     pub fn add_leaf_with_ver(
         self,
@@ -120,6 +133,36 @@ impl P2qrhBuilder {
     pub fn into_inner(self) -> TaprootBuilder {
         self.inner
     }
+
+    /// Creates a new [`TaprootSpendInfo`] from a list of scripts (with default script version) and
+    /// weights of satisfaction for that script.
+    ///  
+    /// The weights represent the probability of each branch being taken. If probabilities/weights
+    /// for each condition are known, constructing the tree as a Huffman Tree is the optimal way to
+    /// minimize average case satisfaction cost. This function takes as input an iterator of
+    /// `tuple(u32, ScriptBuf)` where `u32` represents the satisfaction weights of the branch. For
+    /// example, [(3, S1), (2, S2), (5, S3)] would construct a [`TapTree`] that has optimal
+    /// satisfaction weight when probability for S1 is 30%, S2 is 20% and S3 is 50%. 
+    ///  
+    /// # Errors:
+    ///  
+    /// - When the optimal Huffman Tree has a depth more than 128. 
+    /// - If the provided list of script weights is empty.
+    ///  
+    /// # Edge Cases:
+    ///  
+    /// If the script weight calculations overflow, a sub-optimal tree may be generated. This should
+    /// not happen unless you are dealing with billions of branches with weights close to 2^32.
+    ///  
+    /// [`TapTree`]: crate::taproot::TapTree
+    pub fn with_huffman_tree<I>(script_weights: I) -> Result<Self, TaprootBuilderError>
+    where
+        I: IntoIterator<Item = (u32, ScriptBuf)>,
+    {    
+        let inner = TaprootBuilder::with_huffman_tree(script_weights)?;
+        Ok(P2qrhBuilder { inner })
+    }
+    
 }
 
 // type alias for versioned tap script corresponding Merkle proof
