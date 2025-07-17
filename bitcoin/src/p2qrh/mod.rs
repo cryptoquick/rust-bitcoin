@@ -25,10 +25,17 @@ sha256t_hash_newtype! {
 
     /// P2QRH-tagged hash with tag "QuantumRoot".
     ///
-    /// This is used for computing the merkle root in P2QRH outputs.
+    /// This is used for computing the quantum root in P2QRH outputs.
     #[hash_newtype(forward)]
     pub struct QuantumRootHash(_);
 }
+
+/// The control byte is the same as the control byte in a P2TR control block, including the 7 bits are used to specify the tapleaf version.
+/// The parity bit of the control byte is always 1 since P2QRH does not have a key-spend path.
+pub const P2QRH_CONTROL_BYTE: u8 = 0xc1;
+
+/// P2QRH leaf version will always be 0xc0
+pub const P2QRH_LEAF_VERSION: u8 = 0xc0;
 
 /// A wrapper around ScriptBuf for P2QRH (Pay to Quantum Resistant Hash) scripts.
 pub struct P2qrhScriptBuf {
@@ -118,14 +125,14 @@ impl P2qrhBuilder {
 
     /// Finalizes the P2QRH builder.
     pub fn finalize(self) -> Result<P2qrhSpendInfo, P2qrhError> {
-        let node_info: NodeInfo = self.inner.try_into_node_info().unwrap();
+        let merkle_root_node_info: NodeInfo = self.inner.try_into_node_info().unwrap();
         
         // From BIP-0360:
-        //  instead of the root of the Merkle tree being hashed together with the internal key in P2QRH the root is hashed by itself using the tag "QuantumRoot".
-        let quantum_root = QuantumRootHash::hash(node_info.node_hash().as_ref());
+        // Instead of the root of the Merkle tree being hashed together with the internal key in P2QRH the root is hashed by itself using the tag "QuantumRoot".
+        let quantum_root = QuantumRootHash::hash(merkle_root_node_info.node_hash().as_ref());
         
         Ok(P2qrhSpendInfo {
-            quantum_root: Some(TapNodeHash::from_byte_array(quantum_root.to_byte_array()))
+            quantum_root: Some(quantum_root)
         })
     }
 
@@ -173,7 +180,7 @@ type ScriptMerkleProofMap = BTreeMap<(ScriptBuf, LeafVersion), BTreeSet<TaprootM
 pub struct P2qrhSpendInfo {
 
     /// The merkle root of the script path.
-    pub quantum_root: Option<TapNodeHash>,
+    pub quantum_root: Option<QuantumRootHash>,
 
     /*
     /// Map from (script, leaf_version) to (sets of) [`TaprootMerkleBranch`]. More than one control
@@ -210,16 +217,20 @@ impl P2qrhSpendInfo {
 /// This is a simplified version of Taproot's control block that excludes key-related fields.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct P2qrhControlBlock {
-    /// The version of the leaf.
-    pub leaf_version: LeafVersion,
     /// The merkle branch of the leaf.
     pub merkle_branch: TaprootMerkleBranch,
 }
 
 impl P2qrhControlBlock {
+
     /// Creates a new P2QRH control block.
-    pub fn new(leaf_version: LeafVersion, merkle_branch: TaprootMerkleBranch) -> Self {
-        Self { leaf_version, merkle_branch }
+    /// 
+    /// This is a simplified version of Taproot's control block that excludes key-related fields.
+    ///
+    /// The merkle branch is the path from the leaf to the quantum root.
+    /// 
+    pub fn new(merkle_branch: TaprootMerkleBranch) -> Self {
+        Self { merkle_branch }
     }
 
     /// Returns the size of control block. Faster and more efficient than calling
@@ -229,23 +240,35 @@ impl P2qrhControlBlock {
     }
 
     /// Serializes to a writer.
-    ///
     /// ReturnsThe number of bytes written to the writer.
     pub fn encode<W: Write + ?Sized>(&self, writer: &mut W) -> io::Result<usize> {
-        writer.write_all(&[self.leaf_version.to_consensus() as u8])?;
+        writer.write_all(&[P2QRH_CONTROL_BYTE])?;
         self.merkle_branch.encode(writer)?;
         Ok(self.size())
     }
 
     /// Serializes the control block.
-    ///
-    /// This would be required when using [`P2qrhControlBlock`] as a witness element while spending an
-    /// output via script path. This serialization does not include the [`crate::VarInt`] prefix that would
-    /// be applied when encoding this element as a witness.
     pub fn serialize(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(self.size());
         self.encode(&mut buf).expect("writers don't error");
         buf
+    }
+
+    /// Given a quantum_root and Script, verify that the merkle path found in this control block is correct.
+    pub fn verify_script_in_quantum_root_path( &self,
+        script: &Script,
+        quantum_root: QuantumRootHash) {
+        // compute the script hash
+        // Initially the curr_hash is the leaf hash
+        let mut curr_hash = TapNodeHash::from_script(script, LeafVersion::from_consensus(P2QRH_LEAF_VERSION).unwrap());
+        
+        // re-construct the merkle root referencing the merkle path found in this control block
+        for elem in &self.merkle_branch {
+            // Recalculate the curr hash as parent hash
+            curr_hash = TapNodeHash::from_node_hashes(curr_hash, *elem);
+        }
+
+        assert_eq!(quantum_root, QuantumRootHash::hash(curr_hash.as_ref()) );
     }
 }
 
