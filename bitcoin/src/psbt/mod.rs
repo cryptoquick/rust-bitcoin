@@ -457,7 +457,6 @@ impl Psbt {
                     used.push(internal_key);
                 }
             }
-
             // script path spend
             if let Some((leaf_hashes, _)) = input.tap_key_origins.get(&xonly) {
                 let leaf_hashes = leaf_hashes
@@ -465,7 +464,6 @@ impl Psbt {
                     .filter(|lh| !input.tap_script_sigs.contains_key(&(xonly, **lh)))
                     .cloned()
                     .collect::<Vec<_>>();
-
                 if !leaf_hashes.is_empty() {
                     let key_pair = Keypair::from_secret_key(secp, &sk.inner);
 
@@ -551,6 +549,10 @@ impl Psbt {
                 // This PSBT signing API is WIP, taproot to come shortly.
                 Err(SignError::Unsupported)
             }
+            Qrh => {
+                // This PSBT signing API is WIP, quantum root hash to come shortly.
+                Err(SignError::Unsupported)
+            }
         }
     }
 
@@ -573,7 +575,7 @@ impl Psbt {
         let input = self.checked_input(input_index)?;
 
         match self.output_type(input_index)? {
-            Tr => {
+            Tr | Qrh => {
                 let hash_ty = input
                     .sighash_type
                     .unwrap_or_else(|| TapSighashType::Default.into())
@@ -694,6 +696,10 @@ impl Psbt {
 
         if spk.is_p2tr() {
             return Ok(OutputType::Tr);
+        }
+
+        if spk.is_qrh() {
+            return Ok(OutputType::Qrh);
         }
 
         // Something is wrong with the input scriptPubkey or we do not know how to sign
@@ -960,6 +966,8 @@ pub enum OutputType {
     Sh,
     /// A taproot output (P2TR).
     Tr,
+    /// A quantum root hash output (QRH).
+    Qrh,
 }
 
 impl OutputType {
@@ -969,7 +977,7 @@ impl OutputType {
 
         match self {
             Bare | Wpkh | Wsh | ShWpkh | ShWsh | Sh => SigningAlgorithm::Ecdsa,
-            Tr => SigningAlgorithm::Schnorr,
+            Tr | Qrh => SigningAlgorithm::Schnorr,
         }
     }
 }

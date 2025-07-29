@@ -344,6 +344,14 @@ impl Script {
             && self.0[1] == OP_PUSHBYTES_32.to_u8()
     }
 
+    /// Checks whether a script pubkey is a QRH output.
+    #[inline]
+    pub fn is_qrh(&self) -> bool {
+        self.0.len() == 34
+            && self.witness_version() == Some(WitnessVersion::V3)
+            && self.0[1] == OP_PUSHBYTES_32.to_u8()
+    }
+
     /// Check if this is an OP_RETURN output.
     #[inline]
     pub fn is_op_return(&self) -> bool {

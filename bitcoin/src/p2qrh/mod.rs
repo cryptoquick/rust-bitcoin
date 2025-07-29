@@ -67,6 +67,11 @@ impl P2qrhScriptBuf {
     pub fn as_script(&self) -> &Script {
         self.inner.as_script()
     }
+
+    /// Returns the scriptBuf as a reference.
+    pub fn as_scriptbuf(&self) -> ScriptBuf {
+        self.inner.clone()
+    }
 }
 
 /// A builder for P2QRH (Pay to Quantum Resistant Hash) scripts.
@@ -216,6 +221,8 @@ impl P2qrhSpendInfo {
 /// A control block for P2QRH (Pay to Quantum Resistant Hash) script path spending.
 /// This is a simplified version of Taproot's control block that excludes key-related fields.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(crate = "actual_serde"))]
 pub struct P2qrhControlBlock {
     /// The merkle branch of the leaf.
     pub merkle_branch: TaprootMerkleBranch,
@@ -245,6 +252,18 @@ impl P2qrhControlBlock {
         writer.write_all(&[P2QRH_CONTROL_BYTE])?;
         self.merkle_branch.encode(writer)?;
         Ok(self.size())
+    }
+
+    /// Decodes a P2QRH control block from a slice.
+    pub fn decode(sl: &[u8]) -> Result<P2qrhControlBlock, P2qrhError> {
+        if sl.len() < TAPROOT_CONTROL_BASE_SIZE
+            || (sl.len() - TAPROOT_CONTROL_BASE_SIZE) % TAPROOT_CONTROL_NODE_SIZE != 0
+        {
+            return Err(P2qrhError::InvalidControlBlockSize(sl.len()));
+        }
+        let merkle_branch = TaprootMerkleBranch::decode(&sl[TAPROOT_CONTROL_BASE_SIZE..])
+            .map_err(|_| P2qrhError::InvalidControlBlockSize(sl.len()))?;
+        Ok(P2qrhControlBlock { merkle_branch })
     }
 
     /// Serializes the control block.
@@ -277,4 +296,5 @@ impl P2qrhControlBlock {
 pub enum P2qrhError {
     /// An error that occurs when adding a leaf to the P2QRH builder.
     LeafAdditionError,
+    InvalidControlBlockSize(usize),
 }
