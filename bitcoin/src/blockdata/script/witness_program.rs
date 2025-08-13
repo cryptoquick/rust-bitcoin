@@ -72,8 +72,8 @@ impl WitnessProgram {
     }
 
     /// Creates a [`WitnessProgram`] from a 32 byte merkle root.
-    fn new_p2qrh(program: [u8; 32]) -> Self {
-        WitnessProgram { version: WitnessVersion::V3, program: ArrayVec::from_slice(&program) }
+    fn new_p2tsh(program: [u8; 32]) -> Self {
+        WitnessProgram { version: WitnessVersion::V2, program: ArrayVec::from_slice(&program) }
     }
 
     /// Creates a [`WitnessProgram`] from `pk` for a P2WPKH output.
@@ -105,10 +105,10 @@ impl WitnessProgram {
         WitnessProgram::new_p2tr(pubkey)
     }
 
-    /// Creates a pay to quantum resistant hash address from a merkle root.
-    pub fn p2qrh(merkle_root: Option<TapNodeHash>) -> Self {
+    /// Creates a pay to taproot script hash address from a merkle root.
+    pub fn p2tsh(merkle_root: Option<TapNodeHash>) -> Self {
         let merkle_root = merkle_root.unwrap();
-        WitnessProgram::new_p2qrh(merkle_root.to_byte_array())
+        WitnessProgram::new_p2tsh(merkle_root.to_byte_array())
     }
 
     /// Returns the witness program version.

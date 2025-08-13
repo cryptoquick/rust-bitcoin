@@ -344,11 +344,11 @@ impl Script {
             && self.0[1] == OP_PUSHBYTES_32.to_u8()
     }
 
-    /// Checks whether a script pubkey is a QRH output.
+    /// Checks whether a script pubkey is a TSH output.
     #[inline]
-    pub fn is_qrh(&self) -> bool {
+    pub fn is_p2tsh(&self) -> bool {
         self.0.len() == 34
-            && self.witness_version() == Some(WitnessVersion::V3)
+            && self.witness_version() == Some(WitnessVersion::V2)
             && self.0[1] == OP_PUSHBYTES_32.to_u8()
     }
 

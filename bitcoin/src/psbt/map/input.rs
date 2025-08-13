@@ -21,7 +21,7 @@ use crate::sighash::{
     TapSighashType,
 };
 use crate::taproot::{ControlBlock, LeafVersion, TapLeafHash, TapNodeHash};
-use crate::p2qrh::P2qrhControlBlock;
+use crate::p2tsh::P2tshControlBlock;
 
 /// Type: Non-Witness UTXO PSBT_IN_NON_WITNESS_UTXO = 0x00
 const PSBT_IN_NON_WITNESS_UTXO: u8 = 0x00;
@@ -118,9 +118,9 @@ pub struct Input {
     /// Map of Control blocks to Script version pair.
     #[cfg_attr(feature = "serde", serde(with = "crate::serde_utils::btreemap_as_seq"))]
     pub tap_scripts: BTreeMap<ControlBlock, (ScriptBuf, LeafVersion)>,
-    /// Map of Qrh control blocks to Script version pair.
+    /// Map of Tsh control blocks to Script version pair.
     #[cfg_attr(feature = "serde", serde(with = "crate::serde_utils::btreemap_as_seq"))]
-    pub qrh_scripts: BTreeMap<P2qrhControlBlock, (ScriptBuf, LeafVersion)>,
+    pub tsh_scripts: BTreeMap<P2tshControlBlock, (ScriptBuf, LeafVersion)>,
     /// Map of tap root x only keys to origin info and leaf hashes contained in it.
     #[cfg_attr(feature = "serde", serde(with = "crate::serde_utils::btreemap_as_seq"))]
     pub tap_key_origins: BTreeMap<XOnlyPublicKey, (Vec<TapLeafHash>, KeySource)>,
