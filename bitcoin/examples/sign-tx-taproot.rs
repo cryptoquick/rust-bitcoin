@@ -2,6 +2,8 @@
 
 //! Demonstrate creating a transaction that spends to and from p2tr outputs.
 
+extern crate bitcoin_p2tsh_pqc as bitcoin;
+
 use std::str::FromStr;
 
 use bitcoin::hashes::Hash;

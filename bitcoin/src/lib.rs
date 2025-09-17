@@ -143,6 +143,7 @@ pub use crate::{
     network::{Network, NetworkKind},
     pow::{CompactTarget, Target, Work},
     psbt::Psbt,
+    p2tsh::{P2tshBuilder, P2tshScriptBuf, P2tshControlBlock, P2tshSpendInfo, P2tshError},
     sighash::{EcdsaSighashType, TapSighashType},
     taproot::{TapBranchTag, TapLeafHash, TapLeafTag, TapNodeHash, TapTweakHash, TapTweakTag},
 };
@@ -207,3 +208,5 @@ pub mod parse {
     /// Re-export everything from the [`units::parse`] module.
     pub use units::parse::ParseIntError;
 }
+
+

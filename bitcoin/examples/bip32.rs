@@ -1,4 +1,4 @@
-extern crate bitcoin;
+extern crate bitcoin_p2tsh_pqc as bitcoin;
 
 use std::str::FromStr;
 use std::{env, process};

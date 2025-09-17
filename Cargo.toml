@@ -2,10 +2,14 @@
 members = ["bitcoin", "hashes", "internals", "fuzz", "io", "units", "base58"]
 resolver = "2"
 
+# Workspace-level dependency aliases
+[workspace.dependencies]
+bitcoin = { package = "bitcoin-p2tsh-pqc", path = "bitcoin" }
+
 [patch.crates-io.base58ck]
 path = "base58"
 
-[patch.crates-io.bitcoin]
+[patch.crates-io.bitcoin-p2tsh-pqc]
 path = "bitcoin"
 
 [patch.crates-io.bitcoin_hashes]

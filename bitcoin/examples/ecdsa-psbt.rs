@@ -30,6 +30,8 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+extern crate bitcoin_p2tsh_pqc as bitcoin;
+
 use std::str::FromStr;
 
 use bitcoin::bip32::{ChildNumber, DerivationPath, Fingerprint, IntoDerivationPath, Xpriv, Xpub};

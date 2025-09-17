@@ -1,11 +1,11 @@
 [package]
-name = "bitcoin"
-version = "0.32.6"
+name = "bitcoin-p2tsh-pqc"
+version = "0.32.6-p2tsh-pqc.1"
 authors = ["Andrew Poelstra <apoelstra@wpsoftware.net>"]
 license = "CC0-1.0"
 repository = "https://github.com/rust-bitcoin/rust-bitcoin/"
-documentation = "https://docs.rs/bitcoin/"
-description = "General purpose library for using and interoperating with Bitcoin."
+documentation = "https://docs.rs/bitcoin-p2tsh-pqc/"
+description = "General purpose library for using and interoperating with Bitcoin. Implements BIP0360"
 categories = ["cryptography::cryptocurrencies"]
 keywords = [ "crypto", "bitcoin" ]
 readme = "../README.md"

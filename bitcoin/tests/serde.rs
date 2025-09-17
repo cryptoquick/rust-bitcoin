@@ -22,6 +22,8 @@
 
 #![cfg(feature = "serde")]
 
+extern crate bitcoin_p2tsh_pqc as bitcoin;
+
 use std::collections::BTreeMap;
 use std::str::FromStr;
 
