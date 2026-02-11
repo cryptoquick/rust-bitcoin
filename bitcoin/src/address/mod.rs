@@ -75,7 +75,7 @@ pub enum AddressType {
     /// Pay to taproot.
     P2tr,
     /// Pay to taproot script hash.
-    P2tsh,
+    P2mr,
 }
 
 impl fmt::Display for AddressType {
@@ -86,7 +86,7 @@ impl fmt::Display for AddressType {
             AddressType::P2wpkh => "p2wpkh",
             AddressType::P2wsh => "p2wsh",
             AddressType::P2tr => "p2tr",
-            AddressType::P2tsh => "p2tsh",
+            AddressType::P2mr => "p2mr",
         })
     }
 }
@@ -100,7 +100,7 @@ impl FromStr for AddressType {
             "p2wpkh" => Ok(AddressType::P2wpkh),
             "p2wsh" => Ok(AddressType::P2wsh),
             "p2tr" => Ok(AddressType::P2tr),
-            "p2tsh" => Ok(AddressType::P2tsh),
+            "p2mr" => Ok(AddressType::P2mr),
             _ => Err(UnknownAddressTypeError(s.to_owned())),
         }
     }
@@ -475,8 +475,8 @@ impl Address {
     }
 
     /// Creates a pay to tap script hash address from a merkle root.
-    pub fn p2tsh(merkle_root: Option<TapNodeHash>, hrp: impl Into<KnownHrp>) -> Address {
-        let program = WitnessProgram::p2tsh(merkle_root);
+    pub fn p2mr(merkle_root: Option<TapNodeHash>, hrp: impl Into<KnownHrp>) -> Address {
+        let program = WitnessProgram::p2mr(merkle_root);
         Address::from_witness_program(program, hrp)
     }
 

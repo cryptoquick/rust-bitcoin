@@ -20,26 +20,26 @@ use crate::hashes::{Hash};
 use std::ops::{Deref, DerefMut};
 
 /// The control byte is the same as the control byte in a P2TR control block, including the 7 bits are used to specify the tapleaf version.
-/// The parity bit of the control byte is always 1 since P2TSH does not have a key-spend path.
-pub const P2TSH_CONTROL_BYTE: u8 = 0xc1;
+/// The parity bit of the control byte is always 1 since P2MR does not have a key-spend path.
+pub const P2MR_CONTROL_BYTE: u8 = 0xc1;
 
-/// P2TSH leaf version will always be 0xc0
-pub const P2TSH_LEAF_VERSION: u8 = 0xc0;
+/// P2MR leaf version will always be 0xc0
+pub const P2MR_LEAF_VERSION: u8 = 0xc0;
 
-/// A wrapper around ScriptBuf for P2TSH (Pay to Taproot Script Hash) scripts.
-pub struct P2tshScriptBuf {
+/// A wrapper around ScriptBuf for P2MR (Pay to Taproot Script Hash) scripts.
+pub struct P2mrScriptBuf {
     inner: ScriptBuf
 }
 
-impl P2tshScriptBuf {
-    /// Creates a new P2TSH script from a ScriptBuf.
+impl P2mrScriptBuf {
+    /// Creates a new P2MR script from a ScriptBuf.
     pub fn new(inner: ScriptBuf) -> Self {
         Self { inner }
     }
     
-    /// Generates P2TSH scriptPubKey output
-    /// Only accepts the merkle_root (of type TapNodeHash) since keypath spend is disabled in p2tsh
-    pub fn new_p2tsh(merkle_root: TapNodeHash) -> Self {
+    /// Generates P2MR scriptPubKey output
+    /// Only accepts the merkle_root (of type TapNodeHash) since keypath spend is disabled in p2mr
+    pub fn new_p2mr(merkle_root: TapNodeHash) -> Self {
 
         let merkle_root_hash_bytes: [u8; 32] = merkle_root.to_byte_array();
         let script = Builder::new()
@@ -49,7 +49,7 @@ impl P2tshScriptBuf {
             .push_slice(&merkle_root_hash_bytes)
             
             .into_script();
-        P2tshScriptBuf::new(script)
+        P2mrScriptBuf::new(script)
     }
 
     /// Returns the script as a reference.
@@ -63,13 +63,13 @@ impl P2tshScriptBuf {
     }
 }
 
-/// A builder for P2TSH (Pay to Taproot Script Hash) scripts.
+/// A builder for P2MR (Pay to Taproot Script Hash) scripts.
 #[derive(Clone)]
-pub struct P2tshBuilder {
+pub struct P2mrBuilder {
     inner: TaprootBuilder
 }
 
-impl Deref for P2tshBuilder {
+impl Deref for P2mrBuilder {
     type Target = TaprootBuilder;
 
     fn deref(&self) -> &Self::Target {
@@ -77,56 +77,56 @@ impl Deref for P2tshBuilder {
     }
 }
 
-impl DerefMut for P2tshBuilder {
+impl DerefMut for P2mrBuilder {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.inner
     }
 }
 
-impl P2tshBuilder {
+impl P2mrBuilder {
 
-    /// Creates a new P2TSH builder.
+    /// Creates a new P2MR builder.
     pub fn new() -> Self {
         Self {
             inner: TaprootBuilder::new()
         }
     }
 
-    /// Adds a leaf with standard TapScript version to the P2TSH builder.
+    /// Adds a leaf with standard TapScript version to the P2MR builder.
     pub fn add_leaf(
         self,
         depth: u8,
         script: ScriptBuf
-    ) -> Result<Self, P2tshError> {
+    ) -> Result<Self, P2mrError> {
         match self.inner.add_leaf_with_ver(depth, script, LeafVersion::TapScript) {
             Ok(builder) => Ok(Self { inner: builder }),
-            Err(_) => Err(P2tshError::LeafAdditionError)
+            Err(_) => Err(P2mrError::LeafAdditionError)
         }
     }
 
-    /// Adds a leaf to the P2TSH builder.
+    /// Adds a leaf to the P2MR builder.
     pub fn add_leaf_with_ver(
         self,
         depth: u8,
         script: ScriptBuf,
         leaf_version: LeafVersion,
-    ) -> Result<Self, P2tshError> {
+    ) -> Result<Self, P2mrError> {
         match self.inner.add_leaf_with_ver(depth, script, leaf_version) {
             Ok(builder) => Ok(Self { inner: builder }),
-            Err(_) => Err(P2tshError::LeafAdditionError)
+            Err(_) => Err(P2mrError::LeafAdditionError)
         }
     }
 
-    /// Finalizes the P2TSH builder.
-    pub fn finalize(self) -> Result<P2tshSpendInfo, P2tshError> {
+    /// Finalizes the P2MR builder.
+    pub fn finalize(self) -> Result<P2mrSpendInfo, P2mrError> {
         let merkle_root_node_info: NodeInfo = self.inner.try_into_node_info().unwrap();
         
-        Ok(P2tshSpendInfo {
+        Ok(P2mrSpendInfo {
             merkle_root: Some(merkle_root_node_info.node_hash())
         })
     }
 
-    /// Converts the P2TSH builder into a Taproot builder.
+    /// Converts the P2MR builder into a Taproot builder.
     pub fn into_inner(self) -> TaprootBuilder {
         self.inner
     }
@@ -157,7 +157,7 @@ impl P2tshBuilder {
         I: IntoIterator<Item = (u32, ScriptBuf)>,
     {    
         let inner = TaprootBuilder::with_huffman_tree(script_weights)?;
-        Ok(P2tshBuilder { inner })
+        Ok(P2mrBuilder { inner })
     }
     
 }
@@ -165,9 +165,9 @@ impl P2tshBuilder {
 // type alias for versioned tap script corresponding Merkle proof
 type ScriptMerkleProofMap = BTreeMap<(ScriptBuf, LeafVersion), BTreeSet<TaprootMerkleBranch>>;
 
-/// A struct for P2TSH spend information.
+/// A struct for P2MR spend information.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct P2tshSpendInfo {
+pub struct P2mrSpendInfo {
 
     /// The merkle root of the script path.
     pub merkle_root: Option<TapNodeHash>,
@@ -182,17 +182,17 @@ pub struct P2tshSpendInfo {
 
 }
 
-impl P2tshSpendInfo {
+impl P2mrSpendInfo {
 
     
     /*
     /// Returns a reference to the internal script map.
     pub fn script_map(&self) -> &ScriptMerkleProofMap { &self.script_map }
     
-    pub fn control_block(&self, script_ver: &(ScriptBuf, LeafVersion)) -> Option<P2tshControlBlock> {
+    pub fn control_block(&self, script_ver: &(ScriptBuf, LeafVersion)) -> Option<P2mrControlBlock> {
         // Create our own control block type that doesn't include key information
         if let Some(merkle_branch) = self.script_map().get(script_ver) {
-            Some(P2tshControlBlock {
+            Some(P2mrControlBlock {
                 leaf_version: script_ver.1,
                 merkle_branch: merkle_branch.iter().next().unwrap().clone(),
             })
@@ -203,19 +203,19 @@ impl P2tshSpendInfo {
     */
 }
 
-/// A control block for P2TSH (Pay to Taproot Script Hash) script path spending.
+/// A control block for P2MR (Pay to Taproot Script Hash) script path spending.
 /// This is a simplified version of Taproot's control block that excludes key-related fields.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "serde", serde(crate = "actual_serde"))]
-pub struct P2tshControlBlock {
+pub struct P2mrControlBlock {
     /// The merkle branch of the leaf.
     pub merkle_branch: TaprootMerkleBranch,
 }
 
-impl P2tshControlBlock {
+impl P2mrControlBlock {
 
-    /// Creates a new P2TSH control block.
+    /// Creates a new P2MR control block.
     /// 
     /// This is a simplified version of Taproot's control block that excludes key-related fields.
     ///
@@ -234,21 +234,21 @@ impl P2tshControlBlock {
     /// Serializes to a writer.
     /// ReturnsThe number of bytes written to the writer.
     pub fn encode<W: Write + ?Sized>(&self, writer: &mut W) -> io::Result<usize> {
-        writer.write_all(&[P2TSH_CONTROL_BYTE])?;
+        writer.write_all(&[P2MR_CONTROL_BYTE])?;
         self.merkle_branch.encode(writer)?;
         Ok(self.size())
     }
 
-    /// Decodes a P2TSH control block from a slice.
-    pub fn decode(sl: &[u8]) -> Result<P2tshControlBlock, P2tshError> {
+    /// Decodes a P2MR control block from a slice.
+    pub fn decode(sl: &[u8]) -> Result<P2mrControlBlock, P2mrError> {
         if sl.len() < TAPROOT_CONTROL_BASE_SIZE
             || (sl.len() - TAPROOT_CONTROL_BASE_SIZE) % TAPROOT_CONTROL_NODE_SIZE != 0
         {
-            return Err(P2tshError::InvalidControlBlockSize(sl.len()));
+            return Err(P2mrError::InvalidControlBlockSize(sl.len()));
         }
         let merkle_branch = TaprootMerkleBranch::decode(&sl[TAPROOT_CONTROL_BASE_SIZE..])
-            .map_err(|_| P2tshError::InvalidControlBlockSize(sl.len()))?;
-        Ok(P2tshControlBlock { merkle_branch })
+            .map_err(|_| P2mrError::InvalidControlBlockSize(sl.len()))?;
+        Ok(P2mrControlBlock { merkle_branch })
     }
 
     /// Serializes the control block.
@@ -264,7 +264,7 @@ impl P2tshControlBlock {
         merkle_root: TapNodeHash) {
         // compute the script hash
         // Initially the curr_hash is the leaf hash
-        let mut curr_hash = TapNodeHash::from_script(script, LeafVersion::from_consensus(P2TSH_LEAF_VERSION).unwrap());
+        let mut curr_hash = TapNodeHash::from_script(script, LeafVersion::from_consensus(P2MR_LEAF_VERSION).unwrap());
         
         // re-construct the merkle root referencing the merkle path found in this control block
         for elem in &self.merkle_branch {
@@ -276,10 +276,10 @@ impl P2tshControlBlock {
     }
 }
 
-/// An error type for P2TSH (Pay to Taproot Script Hash) scripts.
+/// An error type for P2MR (Pay to Taproot Script Hash) scripts.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum P2tshError {
-    /// An error that occurs when adding a leaf to the P2TSH builder.
+pub enum P2mrError {
+    /// An error that occurs when adding a leaf to the P2MR builder.
     LeafAdditionError,
     InvalidControlBlockSize(usize),
 }

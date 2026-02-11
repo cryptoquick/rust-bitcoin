@@ -344,9 +344,9 @@ impl Script {
             && self.0[1] == OP_PUSHBYTES_32.to_u8()
     }
 
-    /// Checks whether a script pubkey is a TSH output.
+    /// Checks whether a script pubkey is a P2MR output.
     #[inline]
-    pub fn is_p2tsh(&self) -> bool {
+    pub fn is_p2mr(&self) -> bool {
         self.0.len() == 34
             && self.witness_version() == Some(WitnessVersion::V2)
             && self.0[1] == OP_PUSHBYTES_32.to_u8()

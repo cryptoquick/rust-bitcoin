@@ -1,4 +1,4 @@
-extern crate bitcoin_p2tsh_pqc as bitcoin;
+extern crate bitcoin_p2mr_pqc as bitcoin;
 
 use std::io::{BufReader, Write};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpStream};

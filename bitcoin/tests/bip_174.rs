@@ -1,7 +1,7 @@
 //! Tests PSBT integration vectors from BIP 174
 //! defined at <https://github.com/bitcoin/bips/blob/master/bip-0174.mediawiki#test-vectors>
 
-extern crate bitcoin_p2tsh_pqc as bitcoin;
+extern crate bitcoin_p2mr_pqc as bitcoin;
 
 use std::collections::BTreeMap;
 use std::str::FromStr;

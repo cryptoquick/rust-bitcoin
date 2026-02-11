@@ -109,7 +109,7 @@ pub mod error;
 pub mod hash_types;
 pub mod merkle_tree;
 pub mod network;
-pub mod p2tsh;
+pub mod p2mr;
 pub mod policy;
 pub mod pow;
 pub mod psbt;
@@ -143,7 +143,7 @@ pub use crate::{
     network::{Network, NetworkKind},
     pow::{CompactTarget, Target, Work},
     psbt::Psbt,
-    p2tsh::{P2tshBuilder, P2tshScriptBuf, P2tshControlBlock, P2tshSpendInfo, P2tshError},
+    p2mr::{P2mrBuilder, P2mrScriptBuf, P2mrControlBlock, P2mrSpendInfo, P2mrError},
     sighash::{EcdsaSighashType, TapSighashType},
     taproot::{TapBranchTag, TapLeafHash, TapLeafTag, TapNodeHash, TapTweakHash, TapTweakTag},
 };

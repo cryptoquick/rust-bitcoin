@@ -2,7 +2,7 @@
 
 //! Demonstrate creating a transaction that spends to and from p2tr outputs.
 
-extern crate bitcoin_p2tsh_pqc as bitcoin;
+extern crate bitcoin_p2mr_pqc as bitcoin;
 
 use std::str::FromStr;
 

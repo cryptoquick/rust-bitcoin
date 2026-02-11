@@ -3,7 +3,7 @@
 
 #![cfg(feature = "serde")]
 
-extern crate bitcoin_p2tsh_pqc as bitcoin;
+extern crate bitcoin_p2mr_pqc as bitcoin;
 extern crate serde_json;
 
 macro_rules! test_opcodes {

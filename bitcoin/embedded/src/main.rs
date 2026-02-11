@@ -4,7 +4,7 @@
 #![no_main]
 
 extern crate alloc;
-extern crate bitcoin_p2tsh_pqc as bitcoin;
+extern crate bitcoin_p2mr_pqc as bitcoin;
 
 use alloc::string::ToString;
 use alloc::vec;

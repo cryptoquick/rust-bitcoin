@@ -72,7 +72,7 @@ impl WitnessProgram {
     }
 
     /// Creates a [`WitnessProgram`] from a 32 byte merkle root.
-    fn new_p2tsh(program: [u8; 32]) -> Self {
+    fn new_p2mr(program: [u8; 32]) -> Self {
         WitnessProgram { version: WitnessVersion::V2, program: ArrayVec::from_slice(&program) }
     }
 
@@ -106,9 +106,9 @@ impl WitnessProgram {
     }
 
     /// Creates a pay to taproot script hash address from a merkle root.
-    pub fn p2tsh(merkle_root: Option<TapNodeHash>) -> Self {
+    pub fn p2mr(merkle_root: Option<TapNodeHash>) -> Self {
         let merkle_root = merkle_root.unwrap();
-        WitnessProgram::new_p2tsh(merkle_root.to_byte_array())
+        WitnessProgram::new_p2mr(merkle_root.to_byte_array())
     }
 
     /// Returns the witness program version.

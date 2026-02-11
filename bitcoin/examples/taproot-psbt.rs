@@ -76,7 +76,7 @@ const UTXO_3: P2trUtxo = P2trUtxo {
 };
 
 use std::collections::BTreeMap;
-extern crate bitcoin_p2tsh_pqc as bitcoin;
+extern crate bitcoin_p2mr_pqc as bitcoin;
 
 use std::str::FromStr;
 

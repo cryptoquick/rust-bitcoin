@@ -4,12 +4,12 @@ resolver = "2"
 
 # Workspace-level dependency aliases
 [workspace.dependencies]
-bitcoin = { package = "bitcoin-p2tsh-pqc", path = "bitcoin" }
+bitcoin = { package = "bitcoin-p2mr-pqc", path = "bitcoin" }
 
 [patch.crates-io.base58ck]
 path = "base58"
 
-[patch.crates-io.bitcoin-p2tsh-pqc]
+[patch.crates-io.bitcoin-p2mr-pqc]
 path = "bitcoin"
 
 [patch.crates-io.bitcoin_hashes]

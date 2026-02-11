@@ -549,7 +549,7 @@ impl Psbt {
                 // This PSBT signing API is WIP, taproot to come shortly.
                 Err(SignError::Unsupported)
             }
-            Tsh => {
+            Mr => {
                 // This PSBT signing API is WIP, quantum root hash to come shortly.
                 Err(SignError::Unsupported)
             }
@@ -575,7 +575,7 @@ impl Psbt {
         let input = self.checked_input(input_index)?;
 
         match self.output_type(input_index)? {
-            Tr | Tsh => {
+            Tr | Mr => {
                 let hash_ty = input
                     .sighash_type
                     .unwrap_or_else(|| TapSighashType::Default.into())
@@ -698,8 +698,8 @@ impl Psbt {
             return Ok(OutputType::Tr);
         }
 
-        if spk.is_p2tsh() {
-            return Ok(OutputType::Tsh);
+        if spk.is_p2mr() {
+            return Ok(OutputType::Mr);
         }
 
         // Something is wrong with the input scriptPubkey or we do not know how to sign
@@ -966,8 +966,8 @@ pub enum OutputType {
     Sh,
     /// A taproot output (P2TR).
     Tr,
-    /// A quantum root hash output (P2TSH).
-    Tsh,
+    /// A quantum root hash output (P2MR).
+    Mr,
 }
 
 impl OutputType {
@@ -977,7 +977,7 @@ impl OutputType {
 
         match self {
             Bare | Wpkh | Wsh | ShWpkh | ShWsh | Sh => SigningAlgorithm::Ecdsa,
-            Tr | Tsh => SigningAlgorithm::Schnorr,
+            Tr | Mr => SigningAlgorithm::Schnorr,
         }
     }
 }
