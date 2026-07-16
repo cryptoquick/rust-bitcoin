@@ -1,0 +1,1853 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! A witness.
+//!
+//! This module contains the [`Witness`] struct and related methods to operate on it
+
+use core::fmt;
+use core::ops::Index;
+
+#[cfg(feature = "arbitrary")]
+use arbitrary::{Arbitrary, Unstructured};
+#[cfg(doc)]
+use encoding::Decoder4;
+use encoding::{
+    self, BytesEncoder, CompactSizeDecoder, CompactSizeEncoder, Decoder as _, DecoderStatus,
+    Encoder2,
+};
+#[cfg(feature = "hex")]
+use hex::DecodeVariableLengthBytesError;
+use internals::slice::SliceExt;
+
+#[cfg(feature = "hex")]
+use crate::hex_codec::HexPrimitive;
+use crate::prelude::{Box, Vec};
+#[cfg(doc)]
+use crate::TxIn;
+
+#[rustfmt::skip]                // Keep public re-exports separate.
+#[doc(no_inline)]
+pub use self::error::{UnexpectedEofError, WitnessDecoderError};
+
+use self::error::WitnessDecoderErrorInner;
+
+/// Maximum number of items in a witness stack.
+///
+/// This is an anti-DoS limit based on Bitcoin's 4MB block weight limit.
+/// Witness data is part of transactions, which are part of blocks, so witness
+/// items (assuming 1-byte per item) cannot exceed what fits in a block.
+const MAX_WITNESS_STACK_ITEMS: usize = 4_000_000;
+
+/// Maximum byte size of a single witness stack item.
+///
+/// This is an anti-DoS limit based on Bitcoin's 4MB block weight limit.
+/// Witness data is part of transactions, which are part of blocks, so a
+/// single witness item cannot exceed what fits in a block.
+const MAX_WITNESS_ITEM_SIZE: usize = 4_000_000;
+
+/// The Witness is the data used to unlock bitcoin since the [SegWit upgrade].
+///
+/// Can be logically seen as an array of bytestrings, i.e. `Vec<Vec<u8>>`, and it is serialized on the wire
+/// in that format. You can convert between this type and `Vec<Vec<u8>>` by using [`Witness::from_slice`]
+/// and [`Witness::to_vec`].
+///
+/// For serialization and deserialization performance it is stored internally as a single `Vec`,
+/// saving some allocations.
+///
+/// [SegWit upgrade]: <https://github.com/bitcoin/bips/blob/master/bip-0143.mediawiki>
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Witness {
+    /// Contains the witness `Vec<Vec<u8>>` serialization.
+    ///
+    /// Does not include the initial length prefix indicating the number of elements. Each element
+    /// however, does include a [`CompactSize`] indicating the element length. The number of
+    /// elements is stored in `witness_elements`.
+    ///
+    /// Concatenated onto the end of `content` is the index area. This is a `4 * witness_elements`
+    /// bytes area which stores the index of the start of each witness item.
+    ///
+    /// [`CompactSize`]: <https://en.bitcoin.it/wiki/Protocol_documentation#Variable_length_integer>
+    content: Vec<u8>,
+
+    /// The number of elements in the witness.
+    ///
+    /// Stored separately (instead of as a compact size encoding in the initial part of content) so
+    /// that methods like [`Witness::push`] don't have to shift the entire array.
+    witness_elements: usize,
+
+    /// This is the valid index pointing to the beginning of the index area.
+    ///
+    /// Said another way, this is the total length of all witness elements serialized (without the
+    /// element count but with their sizes serialized as compact size).
+    indices_start: usize,
+}
+
+impl Witness {
+    /// Constructs a new empty [`Witness`].
+    #[inline]
+    pub const fn new() -> Self {
+        Self { content: Vec::new(), witness_elements: 0, indices_start: 0 }
+    }
+
+    /// Constructs a new [`Witness`] object from a slice of bytes slices where each slice is a witness item.
+    pub fn from_slice<T: AsRef<[u8]>>(slice: &[T]) -> Self {
+        let witness_elements = slice.len();
+        let index_size = witness_elements * 4;
+        let content_size = slice
+            .iter()
+            .map(|elem| elem.as_ref().len() + CompactSizeEncoder::encoded_size(elem.as_ref().len()))
+            .sum();
+
+        let mut content = alloc::vec![0u8; content_size + index_size];
+        let mut cursor = 0usize;
+        for (i, elem) in slice.iter().enumerate() {
+            encode_cursor(&mut content, content_size, i, cursor);
+            let encoded = crate::compact_size_encode(elem.as_ref().len());
+            let encoded_size = encoded.as_slice().len();
+            content[cursor..cursor + encoded_size].copy_from_slice(encoded.as_slice());
+            cursor += encoded_size;
+            content[cursor..cursor + elem.as_ref().len()].copy_from_slice(elem.as_ref());
+            cursor += elem.as_ref().len();
+        }
+
+        Self { witness_elements, content, indices_start: content_size }
+    }
+
+    /// Convenience method to create an array of byte-arrays from this witness.
+    #[inline]
+    pub fn to_vec(&self) -> Vec<Vec<u8>> { self.iter().map(<[u8]>::to_vec).collect() }
+
+    /// Returns `true` if the witness contains no element.
+    #[inline]
+    pub fn is_empty(&self) -> bool { self.witness_elements == 0 }
+
+    /// Returns a struct implementing [`Iterator`].
+    #[must_use = "iterators are lazy and do nothing unless consumed"]
+    #[inline]
+    pub fn iter(&self) -> Iter<'_> {
+        Iter { inner: self.content.as_slice(), indices_start: self.indices_start, current_index: 0 }
+    }
+
+    /// Returns the number of elements this witness holds.
+    #[inline]
+    pub const fn len(&self) -> usize { self.witness_elements }
+
+    /// Returns the number of bytes this witness contributes to a transaction's total size.
+    ///
+    /// # Panics
+    ///
+    /// If the size calculation overflows.
+    pub fn size(&self) -> usize {
+        let mut size: usize = 0;
+
+        size += CompactSizeEncoder::encoded_size(self.witness_elements);
+        size += self
+            .iter()
+            .map(|witness_element| {
+                let len = witness_element.len();
+                CompactSizeEncoder::encoded_size(len) + len
+            })
+            .sum::<usize>();
+
+        size
+    }
+
+    /// Clears the witness.
+    #[inline]
+    pub fn clear(&mut self) {
+        self.content.clear();
+        self.witness_elements = 0;
+        self.indices_start = 0;
+    }
+
+    /// Pushes a new element on the witness, requires an allocation.
+    #[inline]
+    pub fn push<T: AsRef<[u8]>>(&mut self, new_element: T) {
+        self.push_slice(new_element.as_ref());
+    }
+
+    /// Pushes a new element slice onto the witness stack.
+    fn push_slice(&mut self, new_element: &[u8]) {
+        self.witness_elements += 1;
+        let previous_content_end = self.indices_start;
+        let encoded = crate::compact_size_encode(new_element.len());
+        let encoded_size = encoded.as_slice().len();
+        let current_content_len = self.content.len();
+        let new_item_total_len = encoded_size + new_element.len();
+        self.content.resize(current_content_len + new_item_total_len + 4, 0);
+
+        self.content[previous_content_end..].rotate_right(new_item_total_len);
+        self.indices_start += new_item_total_len;
+        encode_cursor(
+            &mut self.content,
+            self.indices_start,
+            self.witness_elements - 1,
+            previous_content_end,
+        );
+
+        let end_compact_size = previous_content_end + encoded_size;
+        self.content[previous_content_end..end_compact_size].copy_from_slice(encoded.as_slice());
+        self.content[end_compact_size..end_compact_size + new_element.len()]
+            .copy_from_slice(new_element);
+    }
+
+    /// Returns the last element in the witness, if any.
+    #[inline]
+    pub fn last(&self) -> Option<&[u8]> { self.get_back(0) }
+
+    /// Retrieves an element from the end of the witness by its reverse index.
+    ///
+    /// `index` is 0-based from the end, where 0 is the last element, 1 is the second-to-last, etc.
+    ///
+    /// Returns `None` if the requested index is beyond the witness's elements.
+    ///
+    /// # Examples
+    /// ```
+    /// use bitcoin_primitives::witness::Witness;
+    ///
+    /// let mut witness = Witness::new();
+    /// witness.push(b"A");
+    /// witness.push(b"B");
+    /// witness.push(b"C");
+    /// witness.push(b"D");
+    ///
+    /// assert_eq!(witness.get_back(0), Some(b"D".as_slice()));
+    /// assert_eq!(witness.get_back(1), Some(b"C".as_slice()));
+    /// assert_eq!(witness.get_back(2), Some(b"B".as_slice()));
+    /// assert_eq!(witness.get_back(3), Some(b"A".as_slice()));
+    /// assert_eq!(witness.get_back(4), None);
+    /// ```
+    pub fn get_back(&self, index: usize) -> Option<&[u8]> {
+        if self.witness_elements <= index {
+            None
+        } else {
+            self.get(self.witness_elements - 1 - index)
+        }
+    }
+
+    /// Returns a specific element from the witness by its index, if any.
+    #[inline]
+    pub fn get(&self, index: usize) -> Option<&[u8]> {
+        let pos = decode_cursor(&self.content, self.indices_start, index)?;
+
+        let mut slice = &self.content[pos..]; // Start of element.
+        let element_len = decode_unchecked(&mut slice);
+        let end = cast_to_usize_if_valid(element_len)?;
+        Some(&slice[..end])
+    }
+
+    /// Constructs a new witness from a list of hex strings.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if any of the hex strings are invalid.
+    #[cfg(feature = "hex")]
+    pub fn from_hex<I, T>(iter: I) -> Result<Self, DecodeVariableLengthBytesError>
+    where
+        I: IntoIterator<Item = T>,
+        T: AsRef<str>,
+    {
+        let result = iter
+            .into_iter()
+            .map(|hex_str| crate::hex::decode_to_vec(hex_str.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Self::from_slice(&result))
+    }
+}
+
+/// Correctness Requirements: value must always fit within u32
+// This is duplicated in `bitcoin::blockdata::witness`, if you change it please do so over there also.
+#[inline]
+fn encode_cursor(bytes: &mut [u8], start_of_indices: usize, index: usize, value: usize) {
+    let start = start_of_indices + index * 4;
+    let end = start + 4;
+    bytes[start..end]
+        .copy_from_slice(&u32::to_ne_bytes(value.try_into().expect("larger than u32")));
+}
+
+#[inline]
+fn decode_cursor(bytes: &[u8], start_of_indices: usize, index: usize) -> Option<usize> {
+    let start = start_of_indices + index * 4;
+    let pos = bytes.get_array::<4>(start).map(|index_bytes| u32::from_ne_bytes(*index_bytes))?;
+    usize::try_from(pos).ok()
+}
+
+impl encoding::Encode for Witness {
+    type Encoder<'e>
+        = WitnessEncoder<'e>
+    where
+        Self: 'e;
+
+    fn encoder(&self) -> Self::Encoder<'_> {
+        let num_elements = CompactSizeEncoder::new(self.len());
+        let witness_elements =
+            BytesEncoder::without_length_prefix(&self.content[..self.indices_start]);
+
+        WitnessEncoder::new(Encoder2::new(num_elements, witness_elements))
+    }
+}
+
+impl encoding::Decode for Witness {
+    type Decoder = WitnessDecoder;
+}
+
+encoding::encoder_newtype_exact! {
+    /// The encoder for the [`Witness`] type.
+    #[derive(Debug, Clone)]
+    pub struct WitnessEncoder<'e>(Encoder2<CompactSizeEncoder, BytesEncoder<'e>>);
+}
+
+/// The decoder for the [`Witness`] type.
+#[cfg(feature = "alloc")]
+#[derive(Debug, Clone)]
+pub struct WitnessDecoder {
+    /// The single buffer that will become the Witness content.
+    /// The index entries are written in [`Self::end`].
+    content: Vec<u8>,
+    /// Decoder for the initial witness element count.
+    witness_count_decoder: CompactSizeDecoder,
+    /// Total number of witness elements to decode (None until initial count is read).
+    witness_elements: Option<usize>,
+    /// Index of the current element being decoded.
+    element_idx: usize,
+    /// Decoder for the current element's length.
+    element_length_decoder: CompactSizeDecoder,
+    /// Bytes remaining to read for the current element's data.
+    /// - `None` means we're currently reading the length.
+    /// - `Some(n)` means we're reading element data with `n` bytes remaining.
+    element_bytes_remaining: Option<usize>,
+}
+
+impl WitnessDecoder {
+    /// Constructs a new witness decoder.
+    pub const fn new() -> Self {
+        Self {
+            content: Vec::new(),
+            witness_elements: None,
+            witness_count_decoder: CompactSizeDecoder::new_with_limit(MAX_WITNESS_STACK_ITEMS),
+            element_idx: 0,
+            element_length_decoder: CompactSizeDecoder::new_with_limit(MAX_WITNESS_ITEM_SIZE),
+            element_bytes_remaining: None,
+        }
+    }
+}
+
+impl Default for WitnessDecoder {
+    fn default() -> Self { Self::new() }
+}
+
+impl encoding::Decoder for WitnessDecoder {
+    type Output = Witness;
+    type Error = WitnessDecoderError;
+
+    fn push_bytes(&mut self, bytes: &mut &[u8]) -> Result<DecoderStatus, Self::Error> {
+        use WitnessDecoderError as E;
+        use WitnessDecoderErrorInner as Inner;
+
+        // Read initial witness element count.
+        if self.witness_elements.is_none() {
+            if self
+                .witness_count_decoder
+                .push_bytes(bytes)
+                .map_err(|e| E(Inner::LengthPrefixDecode(e)))?
+                .needs_more()
+            {
+                return Ok(DecoderStatus::NeedsMore);
+            }
+            // Take ownership of the decoder in order to consume it.
+            let decoder = core::mem::take(&mut self.witness_count_decoder);
+            let witness_elements = decoder.end().map_err(|e| E(Inner::LengthPrefixDecode(e)))?;
+            self.witness_elements = Some(witness_elements);
+
+            // Short circuit for zero witness elements.
+            if witness_elements == 0 {
+                return Ok(DecoderStatus::Ready);
+            }
+
+            // Allocate space for the buffer. The buffer
+            // is initialized to 128 bytes which should be large enough
+            // to cover most witnesses, the typical pubkey + signature
+            // and some overhead (e.g. P2WPKH witness is ~100 bytes),
+            // without reallocating.
+            self.content.reserve(128);
+        }
+
+        let Some(witness_elements) = self.witness_elements else {
+            unreachable!("witness_elements must be Some after initial read")
+        };
+
+        // Read witness elements.
+        loop {
+            // Check if we're done processing all elements.
+            if self.element_idx >= witness_elements {
+                return Ok(DecoderStatus::Ready);
+            }
+
+            if bytes.is_empty() {
+                return Ok(DecoderStatus::NeedsMore);
+            }
+
+            // If we have some bytes to read, then reading element data.
+            // Else we are reading the element's length.
+            if let Some(bytes_to_read) = self.element_bytes_remaining {
+                let can_copy = bytes.len().min(bytes_to_read);
+                // To avoid reallocating the index space in `end()` we reserve it here, the moment
+                // the final element's data is copied.
+                if can_copy == bytes_to_read && self.element_idx + 1 == witness_elements {
+                    self.content.reserve_exact(can_copy + witness_elements * 4);
+                }
+                self.content.extend_from_slice(&bytes[..can_copy]);
+                *bytes = &bytes[can_copy..];
+                let remaining = bytes_to_read - can_copy;
+
+                if remaining == 0 {
+                    // Element complete, move to next element.
+                    self.element_idx += 1;
+                    self.element_bytes_remaining = None;
+                } else {
+                    self.element_bytes_remaining = Some(remaining);
+                }
+            } else {
+                if self
+                    .element_length_decoder
+                    .push_bytes(bytes)
+                    .map_err(|e| E(Inner::LengthPrefixDecode(e)))?
+                    .needs_more()
+                {
+                    return Ok(DecoderStatus::NeedsMore);
+                }
+
+                // Take ownership of the decoder so we can consume it.
+                let decoder = core::mem::take(&mut self.element_length_decoder);
+                let element_length = decoder.end().map_err(|e| E(Inner::LengthPrefixDecode(e)))?;
+
+                // keep the element length prefix in the content area.
+                let encoded_compact_size = crate::compact_size_encode(element_length);
+                self.content.extend_from_slice(encoded_compact_size.as_slice());
+
+                if element_length == 0 {
+                    // Complete immediately for zero-length element to
+                    // avoid incorrectly signaling "need more data".
+                    self.element_idx += 1;
+                    self.element_bytes_remaining = None;
+                } else {
+                    self.element_bytes_remaining = Some(element_length);
+                }
+            }
+        }
+    }
+
+    fn end(mut self) -> Result<Self::Output, Self::Error> {
+        use WitnessDecoderError as E;
+        use WitnessDecoderErrorInner as Inner;
+
+        let Some(witness_elements) = self.witness_elements else {
+            // Never read the witness element count.
+            return Err(E(Inner::UnexpectedEof(UnexpectedEofError { missing_elements: 0 })));
+        };
+
+        let remaining = witness_elements - self.element_idx;
+
+        if remaining == 0 {
+            // `content` now holds the complete content area (all element bytes have been already received)
+            // The index area begins at its current end.
+            let indices_start = self.content.len();
+
+            // Build the index area by walking the content area
+            // This is the only allocation sized by the element count, and it happens only here
+            self.content.reserve(witness_elements * 4);
+            let mut read_pos = 0;
+            for _ in 0..witness_elements {
+                let offset = u32::try_from(read_pos).expect("larger than u32");
+                let (element_length, prefix_size) = {
+                    let mut slice = &self.content[read_pos..indices_start];
+                    let before = slice.len();
+                    let element_length = decode_unchecked(&mut slice);
+                    (element_length, before - slice.len())
+                };
+                let data_len = usize::try_from(element_length).expect("element data is present");
+                read_pos += prefix_size + data_len;
+                self.content.extend_from_slice(&offset.to_ne_bytes());
+            }
+
+            Ok(Witness { content: self.content, witness_elements, indices_start })
+        } else {
+            Err(E(Inner::UnexpectedEof(UnexpectedEofError { missing_elements: remaining })))
+        }
+    }
+
+    fn read_limit(&self) -> usize {
+        if self.witness_elements.is_none() {
+            // Reading witness count (haven't started processing elements yet).
+            self.witness_count_decoder.read_limit()
+        } else {
+            // Reading an element.
+            match self.element_bytes_remaining {
+                None => self.element_length_decoder.read_limit(),
+                Some(remaining) => remaining,
+            }
+        }
+    }
+}
+
+// Note: we use `Borrow` in the following `PartialEq` impls specifically because of its additional
+// constraints on equality semantics.
+impl<T: core::borrow::Borrow<[u8]>> PartialEq<[T]> for Witness {
+    fn eq(&self, rhs: &[T]) -> bool {
+        if self.len() != rhs.len() {
+            return false;
+        }
+        self.iter().zip(rhs).all(|(left, right)| left == right.borrow())
+    }
+}
+
+impl<T: core::borrow::Borrow<[u8]>> PartialEq<&[T]> for Witness {
+    fn eq(&self, rhs: &&[T]) -> bool { *self == **rhs }
+}
+
+impl<T: core::borrow::Borrow<[u8]>> PartialEq<Witness> for [T] {
+    fn eq(&self, rhs: &Witness) -> bool { *rhs == *self }
+}
+
+impl<T: core::borrow::Borrow<[u8]>> PartialEq<Witness> for &[T] {
+    fn eq(&self, rhs: &Witness) -> bool { *rhs == **self }
+}
+
+impl<const N: usize, T: core::borrow::Borrow<[u8]>> PartialEq<[T; N]> for Witness {
+    fn eq(&self, rhs: &[T; N]) -> bool { *self == *rhs.as_slice() }
+}
+
+impl<const N: usize, T: core::borrow::Borrow<[u8]>> PartialEq<&[T; N]> for Witness {
+    fn eq(&self, rhs: &&[T; N]) -> bool { *self == *rhs.as_slice() }
+}
+
+impl<const N: usize, T: core::borrow::Borrow<[u8]>> PartialEq<Witness> for [T; N] {
+    fn eq(&self, rhs: &Witness) -> bool { *rhs == *self }
+}
+
+impl<const N: usize, T: core::borrow::Borrow<[u8]>> PartialEq<Witness> for &[T; N] {
+    fn eq(&self, rhs: &Witness) -> bool { *rhs == **self }
+}
+
+impl<T: core::borrow::Borrow<[u8]>> PartialEq<Vec<T>> for Witness {
+    fn eq(&self, rhs: &Vec<T>) -> bool { *self == **rhs }
+}
+
+impl<T: core::borrow::Borrow<[u8]>> PartialEq<Witness> for Vec<T> {
+    fn eq(&self, rhs: &Witness) -> bool { *rhs == *self }
+}
+
+impl<T: core::borrow::Borrow<[u8]>> PartialEq<Box<[T]>> for Witness {
+    fn eq(&self, rhs: &Box<[T]>) -> bool { *self == **rhs }
+}
+
+impl<T: core::borrow::Borrow<[u8]>> PartialEq<Witness> for Box<[T]> {
+    fn eq(&self, rhs: &Witness) -> bool { *rhs == *self }
+}
+
+impl<T: core::borrow::Borrow<[u8]>> PartialEq<alloc::rc::Rc<[T]>> for Witness {
+    fn eq(&self, rhs: &alloc::rc::Rc<[T]>) -> bool { *self == **rhs }
+}
+
+impl<T: core::borrow::Borrow<[u8]>> PartialEq<Witness> for alloc::rc::Rc<[T]> {
+    fn eq(&self, rhs: &Witness) -> bool { *rhs == *self }
+}
+
+#[cfg(target_has_atomic = "ptr")]
+impl<T: core::borrow::Borrow<[u8]>> PartialEq<alloc::sync::Arc<[T]>> for Witness {
+    fn eq(&self, rhs: &alloc::sync::Arc<[T]>) -> bool { *self == **rhs }
+}
+
+#[cfg(target_has_atomic = "ptr")]
+impl<T: core::borrow::Borrow<[u8]>> PartialEq<Witness> for alloc::sync::Arc<[T]> {
+    fn eq(&self, rhs: &Witness) -> bool { *rhs == *self }
+}
+
+/// Debug implementation that displays the witness as a structured output containing:
+/// - Number of witness elements
+/// - Total bytes across all elements
+/// - List of hex-encoded witness elements if `hex` feature is enabled.
+#[allow(clippy::missing_fields_in_debug)] // We don't want to show `indices_start`.
+impl fmt::Debug for Witness {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let total_bytes: usize = self.iter().map(<[u8]>::len).sum();
+
+        f.debug_struct("Witness")
+            .field("num_elements", &self.witness_elements)
+            .field("total_bytes", &total_bytes)
+            .field(
+                "elements",
+                &WrapDebug(|f| {
+                    #[cfg(feature = "hex")]
+                    {
+                        f.debug_list().entries(self.iter().map(hex::DisplayHex::as_hex)).finish()
+                    }
+                    #[cfg(not(feature = "hex"))]
+                    {
+                        f.debug_list().entries(self.iter()).finish()
+                    }
+                }),
+            )
+            .finish()
+    }
+}
+
+/// Formats the witness as a hex string using its consensus encoding.
+///
+/// This is the compact size encoded number of elements followed by each element
+/// prefixed with its compact size encoded length.
+#[cfg(feature = "hex")]
+impl fmt::LowerHex for Witness {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        fmt::LowerHex::fmt(&HexPrimitive(self), f)
+    }
+}
+
+#[cfg(feature = "hex")]
+impl fmt::UpperHex for Witness {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        fmt::UpperHex::fmt(&HexPrimitive(self), f)
+    }
+}
+
+/// An iterator returning individual witness elements.
+#[derive(Clone)]
+pub struct Iter<'a> {
+    inner: &'a [u8],
+    indices_start: usize,
+    current_index: usize,
+}
+
+impl Index<usize> for Witness {
+    type Output = [u8];
+
+    #[track_caller]
+    #[inline]
+    fn index(&self, index: usize) -> &Self::Output { self.get(index).expect("out of bounds") }
+}
+
+impl<'a> Iterator for Iter<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let index = decode_cursor(self.inner, self.indices_start, self.current_index)?;
+        let mut slice = &self.inner[index..]; // Start of element.
+        let element_len = decode_unchecked(&mut slice);
+        let end = cast_to_usize_if_valid(element_len)?;
+        self.current_index += 1;
+        Some(&slice[..end])
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let total_count = (self.inner.len() - self.indices_start) / 4;
+        let remaining = total_count - self.current_index;
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for Iter<'_> {}
+
+impl<'a> IntoIterator for &'a Witness {
+    type IntoIter = Iter<'a>;
+    type Item = &'a [u8];
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter { self.iter() }
+}
+
+impl<T: AsRef<[u8]>> FromIterator<T> for Witness {
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        let mut decoder = WitnessDecoder::new();
+
+        // We can't count the number of witness elements without consuming the iterator.
+        // So instead, we build up the full push_bytes buffer and then push it all at once.
+        // We'll start with a 256 byte buffer to double the initial WitnessDecoder size.
+        let mut buffer = Vec::with_capacity(256);
+        let mut witness_elements = 0;
+
+        // For each witness element, the decoder expects an element length, followed by
+        // the data itself. The iterator's yielded elements do not include the length prefix,
+        // so we add them.
+        for elem in iter {
+            let encoded = crate::compact_size_encode(elem.as_ref().len());
+            buffer.extend_from_slice(encoded.as_slice());
+            buffer.extend_from_slice(elem.as_ref());
+            witness_elements += 1;
+        }
+
+        let witness_count = crate::compact_size_encode(witness_elements);
+        let _ = decoder.push_bytes(&mut witness_count.as_slice());
+
+        let _ = decoder.push_bytes(&mut buffer.as_slice());
+
+        decoder.end().expect("witness_elements in decoder is equal to number of provided elements")
+    }
+}
+
+// Serde keep backward compatibility with old Vec<Vec<u8>> format
+#[cfg(feature = "serde")]
+impl serde::Serialize for Witness {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeSeq;
+
+        let human_readable = serializer.is_human_readable();
+        let mut seq = serializer.serialize_seq(Some(self.witness_elements))?;
+
+        // Note that the `Iter` strips the varints out when iterating.
+        for elem in self {
+            if human_readable {
+                seq.serialize_element(&SerializeBytesAsHex(elem))?;
+            } else {
+                seq.serialize_element(&elem)?;
+            }
+        }
+        seq.end()
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for Witness {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use crate::prelude::String;
+
+        struct Visitor; // Human-readable visitor.
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = Witness;
+
+            fn expecting(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+                write!(f, "a sequence of hex arrays")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut a: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut ret = match a.size_hint() {
+                    Some(len) => Vec::with_capacity(len),
+                    None => Vec::new(),
+                };
+
+                while let Some(elem) = a.next_element::<String>()? {
+                    let vec = hex::decode_to_vec(&elem).map_err(serde::de::Error::custom)?;
+                    ret.push(vec);
+                }
+                Ok(Witness::from_slice(&ret))
+            }
+        }
+
+        if deserializer.is_human_readable() {
+            deserializer.deserialize_seq(Visitor)
+        } else {
+            let vec: Vec<Vec<u8>> = serde::Deserialize::deserialize(deserializer)?;
+            Ok(Self::from_slice(&vec))
+        }
+    }
+}
+
+impl From<Vec<Vec<u8>>> for Witness {
+    #[inline]
+    fn from(vec: Vec<Vec<u8>>) -> Self { Self::from_slice(&vec) }
+}
+
+impl From<&[&[u8]]> for Witness {
+    #[inline]
+    fn from(slice: &[&[u8]]) -> Self { Self::from_slice(slice) }
+}
+
+impl From<&[Vec<u8>]> for Witness {
+    #[inline]
+    fn from(slice: &[Vec<u8>]) -> Self { Self::from_slice(slice) }
+}
+
+impl From<Vec<&[u8]>> for Witness {
+    #[inline]
+    fn from(vec: Vec<&[u8]>) -> Self { Self::from_slice(&vec) }
+}
+
+impl<const N: usize> From<[&[u8]; N]> for Witness {
+    #[inline]
+    fn from(arr: [&[u8]; N]) -> Self { Self::from_slice(&arr) }
+}
+
+impl<const N: usize> From<&[&[u8]; N]> for Witness {
+    #[inline]
+    fn from(arr: &[&[u8]; N]) -> Self { Self::from_slice(arr) }
+}
+
+impl<const N: usize> From<&[[u8; N]]> for Witness {
+    #[inline]
+    fn from(slice: &[[u8; N]]) -> Self { Self::from_slice(slice) }
+}
+
+impl<const N: usize> From<&[&[u8; N]]> for Witness {
+    #[inline]
+    fn from(slice: &[&[u8; N]]) -> Self { Self::from_slice(slice) }
+}
+
+impl<const N: usize, const M: usize> From<[[u8; M]; N]> for Witness {
+    #[inline]
+    fn from(slice: [[u8; M]; N]) -> Self { Self::from_slice(&slice) }
+}
+
+impl<const N: usize, const M: usize> From<&[[u8; M]; N]> for Witness {
+    #[inline]
+    fn from(slice: &[[u8; M]; N]) -> Self { Self::from_slice(slice) }
+}
+
+impl<const N: usize, const M: usize> From<[&[u8; M]; N]> for Witness {
+    #[inline]
+    fn from(slice: [&[u8; M]; N]) -> Self { Self::from_slice(&slice) }
+}
+
+impl<const N: usize, const M: usize> From<&[&[u8; M]; N]> for Witness {
+    #[inline]
+    fn from(slice: &[&[u8; M]; N]) -> Self { Self::from_slice(slice) }
+}
+
+impl Default for Witness {
+    #[inline]
+    fn default() -> Self { Self::new() }
+}
+
+#[cfg(feature = "arbitrary")]
+impl<'a> Arbitrary<'a> for Witness {
+    fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
+        let arbitrary_bytes = Vec::<Vec<u8>>::arbitrary(u)?;
+        Ok(Self::from_slice(&arbitrary_bytes))
+    }
+}
+
+/// Cast a decoded length prefix to a `usize`.
+///
+/// This function is basically just defensive. For all sane use cases the length prefix should be
+/// less than `MAX_VEC_SIZE` (on a 32-bit machine). If the value is bigger that `u16::MAX` and we
+/// are on a 16-bit machine you'll likely hit an error later anyway, better to just check it now.
+///
+/// # 16-bits
+///
+/// The compact size may be bigger than what can be represented in a `usize` on a 16-bit machine but
+/// this shouldn't happen if we created the witness because one would get an OOM error before that.
+fn cast_to_usize_if_valid(n: u64) -> Option<usize> {
+    /// Maximum size, in bytes, of a vector we are allowed to decode.
+    const MAX_VEC_SIZE: u64 = 4_000_000;
+
+    if n > MAX_VEC_SIZE {
+        return None;
+    }
+
+    usize::try_from(n).ok()
+}
+
+/// Gets the compact size encoded value from `slice` and moves slice past the encoding.
+///
+/// Caller to guarantee that the encoding is well formed. Well formed is defined as:
+///
+/// * Being at least long enough.
+/// * Containing a minimal encoding.
+///
+/// # Panics
+///
+/// * Panics in release mode if the `slice` does not contain a valid minimal compact size encoding.
+/// * Panics in debug mode if the encoding is not minimal (referred to as "non-canonical" in Core).
+fn decode_unchecked(slice: &mut &[u8]) -> u64 {
+    assert!(!slice.is_empty(), "tried to decode an empty slice");
+
+    match slice[0] {
+        0xFF => {
+            const SIZE: usize = 9;
+            assert!(slice.len() >= SIZE, "slice too short, expected at least 9 bytes");
+
+            let mut bytes = [0_u8; SIZE - 1];
+            bytes.copy_from_slice(&slice[1..SIZE]);
+
+            let v = u64::from_le_bytes(bytes);
+            debug_assert!(v > u32::MAX.into(), "non-minimal encoding of a u64");
+            *slice = &slice[SIZE..];
+            v
+        }
+        0xFE => {
+            const SIZE: usize = 5;
+            assert!(slice.len() >= SIZE, "slice too short, expected at least 5 bytes");
+
+            let mut bytes = [0_u8; SIZE - 1];
+            bytes.copy_from_slice(&slice[1..SIZE]);
+
+            let v = u32::from_le_bytes(bytes);
+            debug_assert!(v > u16::MAX.into(), "non-minimal encoding of a u32");
+            *slice = &slice[SIZE..];
+            u64::from(v)
+        }
+        0xFD => {
+            const SIZE: usize = 3;
+            assert!(slice.len() >= SIZE, "slice too short, expected at least 3 bytes");
+
+            let mut bytes = [0_u8; SIZE - 1];
+            bytes.copy_from_slice(&slice[1..SIZE]);
+
+            let v = u16::from_le_bytes(bytes);
+            debug_assert!(v >= 0xFD, "non-minimal encoding of a u16");
+            *slice = &slice[SIZE..];
+            u64::from(v)
+        }
+        n => {
+            *slice = &slice[1..];
+            u64::from(n)
+        }
+    }
+}
+
+/// A wrapper for a function that implements `Debug`.
+struct WrapDebug<F: Fn(&mut fmt::Formatter) -> fmt::Result>(pub F);
+
+impl<F: Fn(&mut fmt::Formatter) -> fmt::Result> fmt::Debug for WrapDebug<F> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { (self.0)(f) }
+}
+
+/// Serializes a byte slice using the `hex` crate.
+#[cfg(feature = "serde")]
+struct SerializeBytesAsHex<'a>(pub &'a [u8]);
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for SerializeBytesAsHex<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use hex::DisplayHex;
+
+        serializer.collect_str(&format_args!("{:x}", self.0.as_hex()))
+    }
+}
+
+/// Error types for witness data.
+pub mod error {
+    use core::convert::Infallible;
+    use core::fmt;
+
+    use encoding::CompactSizeDecoderError;
+    use internals::write_err;
+
+    /// An error when consensus decoding a [`Witness`].
+    ///
+    /// [`Witness`]: super::Witness
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct WitnessDecoderError(pub(super) WitnessDecoderErrorInner);
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(super) enum WitnessDecoderErrorInner {
+        /// Error decoding the vector length prefix.
+        LengthPrefixDecode(CompactSizeDecoderError),
+        /// Not enough bytes given to decoder.
+        UnexpectedEof(UnexpectedEofError),
+    }
+
+    impl From<Infallible> for WitnessDecoderError {
+        fn from(never: Infallible) -> Self { match never {} }
+    }
+
+    impl fmt::Display for WitnessDecoderError {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            use WitnessDecoderErrorInner as E;
+
+            match self.0 {
+                E::LengthPrefixDecode(ref e) => write_err!(f, "vec decoder error"; e),
+                E::UnexpectedEof(ref e) => write_err!(f, "decoder error"; e),
+            }
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for WitnessDecoderError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            use WitnessDecoderErrorInner as E;
+
+            match self.0 {
+                E::LengthPrefixDecode(ref e) => Some(e),
+                E::UnexpectedEof(ref e) => Some(e),
+            }
+        }
+    }
+
+    /// Not enough witness elements (bytes) given to decoder.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct UnexpectedEofError {
+        /// Number of elements missing to complete decoder.
+        pub(super) missing_elements: usize,
+    }
+
+    impl From<Infallible> for UnexpectedEofError {
+        fn from(never: Infallible) -> Self { match never {} }
+    }
+
+    impl fmt::Display for UnexpectedEofError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "not enough witness elements for decoder, missing {}", self.missing_elements)
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for UnexpectedEofError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            let Self { missing_elements: _ } = self;
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    #[cfg(feature = "alloc")]
+    use alloc::string::ToString;
+    #[cfg(feature = "alloc")]
+    use alloc::{format, vec};
+    #[cfg(feature = "std")]
+    use std::error::Error as _;
+
+    use encoding::check_encode;
+    #[cfg(feature = "alloc")]
+    use encoding::Decode as _;
+
+    use super::*;
+
+    // A witness with a single element that is empty (zero length).
+    fn single_empty_element() -> Witness { Witness::from([[0u8; 0]]) }
+
+    #[test]
+    fn witness_single_empty_element() {
+        let mut got = Witness::new();
+        got.push([]);
+        let want = single_empty_element();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn push() {
+        // Sanity check default.
+        let mut witness = Witness::default();
+        assert!(witness.is_empty());
+        assert_eq!(witness.last(), None);
+        assert_eq!(witness.get_back(1), None);
+
+        assert_eq!(witness.get(0), None);
+        assert_eq!(witness.get(1), None);
+        assert_eq!(witness.get(2), None);
+        assert_eq!(witness.get(3), None);
+
+        // Push a single byte element onto the witness stack.
+        let push = [11_u8];
+        witness.push(push);
+        assert!(!witness.is_empty());
+
+        assert_eq!(witness, [[11_u8]]);
+
+        let element_0 = push.as_slice();
+        assert_eq!(element_0, &witness[0]);
+
+        assert_eq!(witness.get_back(1), None);
+        assert_eq!(witness.last(), Some(element_0));
+
+        assert_eq!(witness.get(0), Some(element_0));
+        assert_eq!(witness.get(1), None);
+        assert_eq!(witness.get(2), None);
+        assert_eq!(witness.get(3), None);
+
+        // Now push 2 byte element onto the witness stack.
+        let push = [21u8, 22u8];
+        witness.push(push);
+
+        assert_eq!(witness, [&[11_u8] as &[_], &[21, 22]]);
+
+        let element_1 = push.as_slice();
+        assert_eq!(element_1, &witness[1]);
+
+        assert_eq!(witness.get(0), Some(element_0));
+        assert_eq!(witness.get(1), Some(element_1));
+        assert_eq!(witness.get(2), None);
+        assert_eq!(witness.get(3), None);
+
+        assert_eq!(witness.get_back(1), Some(element_0));
+        assert_eq!(witness.last(), Some(element_1));
+
+        // Now push another 2 byte element onto the witness stack.
+        let push = [31u8, 32u8];
+        witness.push(push);
+
+        assert_eq!(witness, [&[11_u8] as &[_], &[21, 22], &[31, 32]]);
+
+        let element_2 = push.as_slice();
+        assert_eq!(element_2, &witness[2]);
+
+        assert_eq!(witness.get(0), Some(element_0));
+        assert_eq!(witness.get(1), Some(element_1));
+        assert_eq!(witness.get(2), Some(element_2));
+        assert_eq!(witness.get(3), None);
+
+        assert_eq!(witness.get_back(2), Some(element_0));
+        assert_eq!(witness.get_back(1), Some(element_1));
+        assert_eq!(witness.last(), Some(element_2));
+    }
+
+    #[test]
+    fn exact_sized_iterator() {
+        let arbitrary_element = [1_u8, 2, 3];
+        let num_pushes = 5; // Somewhat arbitrary.
+
+        let mut witness = Witness::default();
+
+        for i in 0..num_pushes {
+            assert_eq!(witness.iter().len(), i);
+            witness.push(arbitrary_element);
+        }
+
+        let mut iter = witness.iter();
+        for i in (0..=num_pushes).rev() {
+            assert_eq!(iter.len(), i);
+            iter.next();
+        }
+    }
+
+    #[test]
+    fn witness_from_impl() {
+        // Test From implementations with the same 2 elements
+        let vec = vec![vec![11], vec![21, 22]];
+        let slice_vec: &[Vec<u8>] = &vec;
+        let slice_slice: &[&[u8]] = &[&[11u8], &[21, 22]];
+        let vec_slice: Vec<&[u8]> = vec![&[11u8], &[21, 22]];
+
+        let witness_vec_vec = Witness::from(vec.clone());
+        let witness_slice_vec = Witness::from(slice_vec);
+        let witness_slice_slice = Witness::from(slice_slice);
+        let witness_vec_slice = Witness::from(vec_slice);
+
+        let mut expected = Witness::from_slice(&vec);
+        assert_eq!(expected.len(), 2);
+        assert_eq!(expected.to_vec(), vec);
+
+        assert_eq!(witness_vec_vec, expected);
+        assert_eq!(witness_slice_vec, expected);
+        assert_eq!(witness_slice_slice, expected);
+        assert_eq!(witness_vec_slice, expected);
+
+        // Test clear method
+        expected.clear();
+        assert!(expected.is_empty());
+    }
+
+    #[test]
+    fn witness_from_array_impl() {
+        const DATA_1: [u8; 3] = [1, 2, 3];
+        const DATA_2: [u8; 3] = [4, 5, 6];
+        let witness = Witness::from_slice(&[DATA_1, DATA_2]);
+
+        let witness_from_array_ref = Witness::from(&[DATA_1, DATA_2]);
+        let witness_from_array_of_refs = Witness::from([&DATA_1, &DATA_2]);
+        let witness_from_ref_to_array_of_refs = Witness::from(&[&DATA_1, &DATA_2]);
+        let witness_from_fixed_array = Witness::from([DATA_1, DATA_2]);
+        let witness_from_slice_of_refs = Witness::from(&[&DATA_1, &DATA_2][..]);
+        let witness_from_nested_array = Witness::from(&[DATA_1, DATA_2][..]);
+
+        assert_eq!(witness_from_array_ref, witness);
+        assert_eq!(witness_from_array_of_refs, witness);
+        assert_eq!(witness_from_ref_to_array_of_refs, witness);
+        assert_eq!(witness_from_fixed_array, witness);
+        assert_eq!(witness_from_slice_of_refs, witness);
+        assert_eq!(witness_from_nested_array, witness);
+    }
+
+    #[test]
+    fn witness_size() {
+        let mut witness = Witness::new();
+        let want = 1; // Number of elements compact size encoded.
+        assert_eq!(witness.size(), want);
+
+        witness.push([1, 2, 3]);
+        let want = 5; // 1 + 1 + 3
+        assert_eq!(witness.size(), want);
+
+        witness.push([4, 5]);
+        let want = 8; // 5 + 1 + 2
+        assert_eq!(witness.size(), want);
+    }
+
+    #[test]
+    fn partial_eq() {
+        const EMPTY_BYTES: &[u8] = &[];
+        const DATA_1: &[u8] = &[42];
+        const DATA_2: &[u8] = &[42, 21];
+
+        macro_rules! ck {
+            ($witness:expr, $container:expr, $different:expr) => {{
+                let witness = $witness;
+                let container = $container;
+                let different = $different;
+
+                assert_eq!(witness, container, stringify!($container));
+                assert_eq!(container, witness, stringify!($container));
+
+                assert_ne!(witness, different, stringify!($container));
+                assert_ne!(different, witness, stringify!($container));
+            }};
+        }
+
+        // &[T]
+        let container: &[&[u8]] = &[EMPTY_BYTES];
+        let different: &[&[u8]] = &[DATA_1];
+        ck!(Witness::from(container), container, different);
+
+        let container: &[&[u8]] = &[DATA_1];
+        let different: &[&[u8]] = &[DATA_2];
+        ck!(Witness::from(container), container, different);
+
+        // &[T; N]
+        let container: &[&[u8]; 2] = &[DATA_1, DATA_2];
+        let different: &[&[u8]; 2] = &[DATA_2, DATA_1];
+        ck!(Witness::from(container), container, different);
+
+        // [&[T]; N]
+        let container: [&[u8]; 2] = [DATA_1, DATA_2];
+        let different: [&[u8]; 2] = [DATA_2, DATA_1];
+        ck!(Witness::from(container), container, different);
+
+        // Vec<T>
+        let container: Vec<&[u8]> = vec![DATA_1, DATA_2];
+        let different: Vec<&[u8]> = vec![DATA_2, DATA_1];
+        ck!(Witness::from(container.as_slice()), container, different);
+
+        // Box<[T]>
+        let container: Box<[&[u8]]> = vec![DATA_1, DATA_2].into_boxed_slice();
+        let different: Box<[&[u8]]> = vec![DATA_2, DATA_1].into_boxed_slice();
+        ck!(Witness::from(&*container), container, different);
+
+        // Rc<[T]>
+        let container: alloc::rc::Rc<[&[u8]]> = vec![DATA_1, DATA_2].into();
+        let different: alloc::rc::Rc<[&[u8]]> = vec![DATA_2, DATA_1].into();
+        ck!(Witness::from(&*container), container, different);
+
+        // Arc<[T]>
+        let container: alloc::sync::Arc<[&[u8]]> = vec![DATA_1, DATA_2].into();
+        let different: alloc::sync::Arc<[&[u8]]> = vec![DATA_2, DATA_1].into();
+        ck!(Witness::from(&*container), container, different);
+    }
+
+    #[test]
+    fn partial_eq_for_slice() {
+        let witness = Witness::from_slice(&[vec![1, 2, 3], vec![4, 5, 6]]);
+        let container: &[Vec<u8>] = &[vec![1, 2, 3], vec![4, 5, 6]];
+        let different: &[Vec<u8>] = &[vec![1, 2], vec![4, 5]];
+
+        // Explicitly dereference the slice to invoke the `[T]` implementation.
+        assert_eq!(*container, witness);
+        assert_ne!(*different, witness);
+    }
+
+    #[test]
+    fn partial_eq_len_mismatch() {
+        let witness = Witness::from_slice(&[&[1u8][..]]);
+        let rhs = vec![vec![1u8], vec![2u8]];
+        assert_ne!(witness, rhs.as_slice());
+    }
+
+    #[test]
+    #[cfg(feature = "serde")]
+    fn serde_bincode_backward_compatibility() {
+        let old_witness_format = vec![vec![0u8], vec![2]];
+        let new_witness_format = Witness::from_slice(&old_witness_format);
+
+        let old = bincode::serialize(&old_witness_format).unwrap();
+        let new = bincode::serialize(&new_witness_format).unwrap();
+
+        assert_eq!(old, new);
+    }
+
+    #[cfg(feature = "serde")]
+    fn arbitrary_witness() -> Witness {
+        let mut witness = Witness::default();
+
+        witness.push([0_u8]);
+        witness.push([1_u8; 32]);
+        witness.push([2_u8; 72]);
+
+        witness
+    }
+
+    #[test]
+    #[cfg(feature = "serde")]
+    fn serde_bincode_roundtrips() {
+        let original = arbitrary_witness();
+        let ser = bincode::serialize(&original).unwrap();
+        let roundtrip: Witness = bincode::deserialize(&ser).unwrap();
+        assert_eq!(roundtrip, original);
+    }
+
+    #[test]
+    #[cfg(feature = "serde")]
+    fn serde_human_roundtrips() {
+        let original = arbitrary_witness();
+        let ser = serde_json::to_string(&original).unwrap();
+        let roundtrip: Witness = serde_json::from_str(&ser).unwrap();
+        assert_eq!(roundtrip, original);
+    }
+
+    #[test]
+    #[cfg(feature = "serde")]
+    fn serde_human() {
+        let witness = Witness::from_slice(&[vec![0u8, 123, 75], vec![2u8, 6, 3, 7, 8]]);
+        let json = serde_json::to_string(&witness).unwrap();
+        assert_eq!(json, r#"["007b4b","0206030708"]"#);
+    }
+
+    #[test]
+    fn test_witness_from_iterator() {
+        let bytes1 = [1u8, 2, 3];
+        let bytes2 = [4u8, 5];
+        let bytes3 = [6u8, 7, 8, 9];
+        let data = [&bytes1[..], &bytes2[..], &bytes3[..]];
+
+        // Use FromIterator directly
+        let witness1 = Witness::from_iter(data);
+
+        // Create a witness manually for comparison
+        let mut witness2 = Witness::new();
+        for item in &data {
+            witness2.push(item);
+        }
+        assert_eq!(witness1, witness2);
+        assert_eq!(witness1.len(), witness2.len());
+        assert_eq!(witness1.to_vec(), witness2.to_vec());
+
+        // Test with collect
+        let bytes4 = [0u8, 123, 75];
+        let bytes5 = [2u8, 6, 3, 7, 8];
+        let data = [bytes4.to_vec(), bytes5.to_vec()];
+        let witness3: Witness = data.iter().collect();
+        assert_eq!(witness3.len(), 2);
+        assert_eq!(witness3.to_vec(), data);
+
+        // Test with empty iterator
+        let empty_data: Vec<Vec<u8>> = vec![];
+        let witness4: Witness = empty_data.iter().collect();
+        assert!(witness4.is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "hex")]
+    fn test_from_hex() {
+        let hex_strings = [
+            "30440220703350f1c8be5b41b4cb03b3b680c4f3337f987514a6b08e16d5d9f81e9b5f72022018fb269ba5b82864c0e1edeaf788829eb332fe34a859cc1f99c4a02edfb5d0df01",
+            "0208689fe2cca52d8726cefaf274de8fa61d5faa5e1058ad35b49fb194c035f9a4",
+        ];
+
+        let witness = Witness::from_hex(hex_strings).unwrap();
+        assert_eq!(witness.len(), 2);
+    }
+
+    #[test]
+    #[cfg(feature = "hex")]
+    fn empty_witness_lower_hex() {
+        let empty = Witness::new();
+        assert_eq!(format!("{:x}", empty), "00");
+    }
+
+    #[test]
+    #[cfg(feature = "hex")]
+    fn witness_lower_hex() {
+        let witness = Witness::from_iter([[1u8, 2, 3].as_slice(), [4u8, 5].as_slice()]);
+        // count (0x02), then len-prefixed elements: 03 010203, 02 0405.
+        assert_eq!(format!("{:x}", witness), "0203010203020405");
+    }
+
+    #[test]
+    #[cfg(feature = "hex")]
+    fn witness_upper_hex() {
+        let witness = Witness::from_iter([[0xABu8, 0xCD].as_slice()]);
+        assert_eq!(format!("{:X}", witness), "0102ABCD");
+    }
+
+    #[test]
+    fn encode() {
+        let bytes1 = [1u8, 2, 3];
+        let bytes2 = [4u8, 5];
+        let bytes3 = [6u8, 7, 8, 9];
+        let data = [&bytes1[..], &bytes2[..], &bytes3[..]];
+
+        // Use FromIterator directly
+        let witness = Witness::from_iter(data);
+
+        let want = [0x03, 0x03, 0x01, 0x02, 0x03, 0x02, 0x04, 0x05, 0x04, 0x06, 0x07, 0x08, 0x09];
+        let got = encoding::encode_to_vec(&witness);
+
+        assert_eq!(&got, &want);
+    }
+
+    #[test]
+    fn encodes_using_correct_chunks() {
+        let bytes1 = [1u8, 2, 3];
+        let bytes2 = [4u8, 5];
+        let data = [&bytes1[..], &bytes2[..]];
+
+        // Use FromIterator directly
+        let witness = Witness::from_iter(data);
+
+        check_encode(&witness, &[2u8, 3u8, 1, 2, 3, 2, 4, 5]);
+    }
+
+    #[test]
+    fn encode_empty() {
+        let witness = Witness::default();
+
+        let want = [0x00];
+        let got = encoding::encode_to_vec(&witness);
+
+        assert_eq!(&got, &want);
+    }
+
+    #[cfg(feature = "alloc")]
+    fn witness_test_case() -> (Witness, Vec<u8>) {
+        let bytes1 = [1u8];
+        let bytes2 = [2u8, 3];
+        let bytes3 = [4u8, 5, 6];
+        let data = [&bytes1[..], &bytes2[..], &bytes3[..]];
+
+        let witness = Witness::from_iter(data);
+
+        #[rustfmt::skip]
+        let encoded = vec![
+            0x03_u8,
+            0x01, 0x01,
+            0x02, 0x02, 0x03,
+            0x03, 0x04, 0x05, 0x06
+        ];
+
+        (witness, encoded)
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn decode_witness_one_single_call() {
+        let (want, encoded) = witness_test_case();
+
+        let mut slice = encoded.as_slice();
+        let mut decoder = WitnessDecoder::new();
+        decoder.push_bytes(&mut slice).unwrap();
+
+        let got = decoder.end().unwrap();
+
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    #[allow(clippy::many_single_char_names)]
+    fn decode_witness_many_calls() {
+        let (want, encoded) = witness_test_case();
+
+        let mut decoder = WitnessDecoder::new();
+
+        let mut a = &encoded.as_slice()[0..1]; // [3]
+        let mut b = &encoded.as_slice()[1..2]; // [1]
+        let mut c = &encoded.as_slice()[2..5]; // [1, 2, 2]
+        let mut d = &encoded.as_slice()[5..6]; // [3]
+        let mut e = &encoded.as_slice()[6..7]; // [3]
+        let mut f = &encoded.as_slice()[7..9]; // [4, 5]
+        let mut g = &encoded.as_slice()[9..]; // [6]
+
+        decoder.push_bytes(&mut a).unwrap();
+        decoder.push_bytes(&mut b).unwrap();
+        decoder.push_bytes(&mut c).unwrap();
+        decoder.push_bytes(&mut d).unwrap();
+        decoder.push_bytes(&mut e).unwrap();
+        decoder.push_bytes(&mut f).unwrap();
+        decoder.push_bytes(&mut g).unwrap();
+
+        let got = decoder.end().unwrap();
+
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn decode_max_length() {
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(crate::compact_size_encode(1usize).as_slice());
+        encoded.extend_from_slice(crate::compact_size_encode(4_000_000usize).as_slice());
+        encoded.resize(encoded.len() + 4_000_000, 0u8);
+
+        let mut slice = encoded.as_slice();
+        let mut decoder = WitnessDecoder::new();
+        decoder.push_bytes(&mut slice).unwrap();
+        let witness = decoder.end().unwrap();
+        assert_eq!(witness[0].len(), 4_000_000);
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn decode_length_prefix_error() {
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(crate::compact_size_encode(1usize).as_slice());
+        encoded.extend_from_slice(crate::compact_size_encode(4_000_001usize).as_slice());
+
+        let mut slice = encoded.as_slice();
+        let mut decoder = WitnessDecoder::new();
+        let err = decoder.push_bytes(&mut slice).unwrap_err();
+        assert!(matches!(
+            err,
+            WitnessDecoderError(WitnessDecoderErrorInner::LengthPrefixDecode(_))
+        ));
+        assert!(!err.to_string().is_empty());
+        #[cfg(feature = "std")]
+        assert!(err.source().is_some());
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn decode_empty_witness() {
+        // Witness with 0 elements.
+        let encoded = vec![0x00];
+        let mut slice = encoded.as_slice();
+        let mut decoder = WitnessDecoder::new();
+
+        assert!(decoder.push_bytes(&mut slice).unwrap().is_ready());
+        let witness = decoder.end().unwrap();
+
+        assert_eq!(witness.len(), 0);
+        assert!(witness.is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn decode_single_element() {
+        // Witness with 1 element containing [0xAB, 0xCD].
+        let encoded = vec![0x01, 0x02, 0xAB, 0xCD];
+        let mut slice = encoded.as_slice();
+        let mut decoder = WitnessDecoder::new();
+
+        assert!(decoder.push_bytes(&mut slice).unwrap().is_ready());
+        let witness = decoder.end().unwrap();
+
+        assert_eq!(witness.len(), 1);
+        assert_eq!(&witness[0], &[0xABu8, 0xCD][..]);
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn decode_empty_element() {
+        // Witness with 1 element that is empty (0 bytes).
+        let encoded = vec![0x01, 0x00];
+        let mut slice = encoded.as_slice();
+        let mut decoder = WitnessDecoder::new();
+
+        assert!(decoder.push_bytes(&mut slice).unwrap().is_ready());
+        let witness = decoder.end().unwrap();
+
+        assert_eq!(witness.len(), 1);
+        assert_eq!(&witness[0], &[] as &[u8]);
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn decode_multiple_empty_elements() {
+        // Witness with 3 empty elements.
+        let encoded = vec![0x03, 0x00, 0x00, 0x00];
+        let mut slice = encoded.as_slice();
+        let mut decoder = WitnessDecoder::new();
+
+        assert!(decoder.push_bytes(&mut slice).unwrap().is_ready());
+        let witness = decoder.end().unwrap();
+
+        assert_eq!(witness.len(), 3);
+        assert_eq!(&witness[0], &[] as &[u8]);
+        assert_eq!(&witness[1], &[] as &[u8]);
+        assert_eq!(&witness[2], &[] as &[u8]);
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn decode_incomplete_witness_count() {
+        // 3-byte compact size but only provide 2 bytes.
+        let encoded = vec![0xFD, 0x03];
+        let mut slice = encoded.as_slice();
+        let mut decoder = WitnessDecoder::new();
+
+        assert!(decoder.push_bytes(&mut slice).unwrap().needs_more());
+
+        let err = decoder.end().unwrap_err();
+        assert!(matches!(err, WitnessDecoderError(WitnessDecoderErrorInner::UnexpectedEof(_))));
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn decode_incomplete_element_length() {
+        // Witness count = 1, but element length is incomplete.
+        let encoded = vec![0x01, 0xFD, 0x05]; // Element length should be 3 bytes.
+        let mut slice = encoded.as_slice();
+        let mut decoder = WitnessDecoder::new();
+
+        assert!(decoder.push_bytes(&mut slice).unwrap().needs_more());
+
+        let err = decoder.end().unwrap_err();
+        assert!(matches!(err, WitnessDecoderError(WitnessDecoderErrorInner::UnexpectedEof(_))));
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn decode_incomplete_element_data() {
+        // Witness count = 1, element length = 5, but only 3 bytes of data provided.
+        let encoded = vec![0x01, 0x05, 0xAA, 0xBB, 0xCC];
+        let mut slice = encoded.as_slice();
+        let mut decoder = WitnessDecoder::new();
+
+        assert!(decoder.push_bytes(&mut slice).unwrap().needs_more());
+
+        let err = decoder.end().unwrap_err();
+        assert!(matches!(err, WitnessDecoderError(WitnessDecoderErrorInner::UnexpectedEof(_))));
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn decoder_read_limit() {
+        let mut decoder = Witness::decoder();
+        // witness_count_decoder is CompactSize: needs 1 byte.
+        assert_eq!(decoder.read_limit(), 1);
+
+        // Set witness count = 1.
+        let mut bytes = [0x01u8].as_slice();
+        decoder.push_bytes(&mut bytes).unwrap();
+        // element_length_decoder is CompactSize: needs 1 byte..
+        assert_eq!(decoder.read_limit(), 1);
+
+        // Provide only first byte of a 3 byte CompactSize.
+        let mut bytes = [0xFDu8].as_slice();
+        decoder.push_bytes(&mut bytes).unwrap();
+        assert_eq!(decoder.read_limit(), 2);
+
+        // Set element length to 500 (0x01F4 little-endian).
+        let mut bytes = [0xF4u8, 0x01].as_slice();
+        decoder.push_bytes(&mut bytes).unwrap();
+        // Decoder now reads element data and the limit becomes the element length.
+        assert_eq!(decoder.read_limit(), 500);
+
+        // Provide 1 byte of element data decreasing the read limit by 1.
+        let mut bytes = [0xAAu8].as_slice();
+        decoder.push_bytes(&mut bytes).unwrap();
+        assert_eq!(decoder.read_limit(), 499);
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn decoder_end_without_witness_count_errors() {
+        let err = WitnessDecoder::new().end().unwrap_err();
+        assert!(matches!(
+            err,
+            WitnessDecoderError(WitnessDecoderErrorInner::UnexpectedEof(UnexpectedEofError {
+                missing_elements: 0
+            }))
+        ));
+        assert!(!err.to_string().is_empty());
+        #[cfg(feature = "std")]
+        assert!(err.source().is_some());
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn decoder_unexpected_eof_error() {
+        let mut decoder = WitnessDecoder::new();
+        let mut slice = [0x01].as_slice(); // witness element count = 1.
+        assert!(decoder.push_bytes(&mut slice).unwrap().needs_more());
+
+        let inner = match decoder.end().unwrap_err() {
+            WitnessDecoderError(WitnessDecoderErrorInner::UnexpectedEof(inner)) => inner,
+            err => panic!("unexpected error: {err}"),
+        };
+        assert!(!inner.to_string().is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn decode_buffer_resizing() {
+        // Create a witness with elements larger than initial 128-byte allocation.
+        let large_element = vec![0xFF; 500];
+        let mut encoded = vec![0x02];
+        encoded.extend_from_slice(&[0xFD, 0xF4, 0x01]);
+        encoded.extend_from_slice(&large_element);
+        encoded.extend_from_slice(&[0xFD, 0xF4, 0x01]);
+        encoded.extend_from_slice(&large_element);
+
+        let mut slice = encoded.as_slice();
+        let mut decoder = WitnessDecoder::new();
+        assert!(decoder.push_bytes(&mut slice).unwrap().is_ready());
+
+        let witness = decoder.end().unwrap();
+        assert_eq!(witness.len(), 2);
+        assert_eq!(&witness[0], large_element.as_slice());
+        assert_eq!(&witness[1], large_element.as_slice());
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn iter_next_none_if_cursor_decode_fails() {
+        let witness = Witness { content: vec![], witness_elements: 1, indices_start: 0 };
+        assert!(witness.iter().next().is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn iter_next_none_if_element_len_too_big() {
+        // Element length = 4_000_001 which is larger than MAX_VEC_SIZE (4_000_000).
+        let mut content = vec![0xFE];
+        content.extend_from_slice(&4_000_001u32.to_le_bytes());
+        let indices_start = content.len();
+        content.extend_from_slice(&u32::to_ne_bytes(0));
+
+        let witness = Witness { content, witness_elements: 1, indices_start };
+        assert!(witness.iter().next().is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn witness_debug() {
+        let witness = Witness::from_slice(&[&[0xAAu8][..]]);
+        let s = format!("{:?}", witness);
+        assert!(!s.is_empty());
+    }
+
+    #[test]
+    fn size_matches_encoding_length() {
+        let empty = Witness::new();
+        assert_eq!(empty.size(), encoding::encode_to_vec(&empty).len());
+
+        let mut witness = Witness::new();
+        witness.push([0u8; 0]);
+        assert_eq!(witness.size(), encoding::encode_to_vec(&witness).len());
+        witness.push([0u8; 252]);
+        assert_eq!(witness.size(), encoding::encode_to_vec(&witness).len());
+        witness.push([0u8; 253]);
+        assert_eq!(witness.size(), encoding::encode_to_vec(&witness).len());
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn witness_encoder_len_matches_encoding_length() {
+        use encoding::{Encode as _, ExactSizeEncoder as _};
+
+        // ExactSizeEncoder::len on a fresh encoder must be equal to total encoded length
+        fn assert_exact_len(witness: &Witness) {
+            let encoded_len = encoding::encode_to_vec(witness).len();
+            assert_eq!(witness.encoder().len(), encoded_len);
+        }
+
+        // empty witness: encodes as a single CompactSize zero byte.
+        assert_exact_len(&Witness::new());
+
+        // Single zero-length element.
+        let mut witness = Witness::new();
+        witness.push([0u8; 0]);
+        assert_exact_len(&witness);
+
+        // Multiple elements of differing sizes.
+        let witness =
+            Witness::from_iter([[1u8, 2, 3].as_slice(), [4u8, 5].as_slice(), [6u8].as_slice()]);
+        assert_exact_len(&witness);
+
+        // Element length crossing the CompactSize one-byte boundary (252 -> 253).
+        let mut witness = Witness::new();
+        witness.push([0u8; 252]);
+        assert_exact_len(&witness);
+        witness.push([0u8; 253]);
+        assert_exact_len(&witness);
+
+        // Element count crossing the CompactSize one-byte boundary: 253 elements
+        // makes the leading count prefix three bytes instead of one.
+        let witness = (0..253u32).map(|_| [0xABu8].as_slice()).collect::<Witness>();
+        assert_exact_len(&witness);
+    }
+
+    #[test]
+    fn decode_value_1_byte() {
+        // Check lower bound, upper bound.
+        for v in [0x00, 0x01, 0x02, 0xFA, 0xFB, 0xFC] {
+            let raw = [v];
+            let mut slice = raw.as_slice();
+            let got = decode_unchecked(&mut slice);
+            assert_eq!(got, u64::from(v));
+            assert!(slice.is_empty());
+        }
+    }
+
+    macro_rules! check_decode {
+        ($($test_name:ident, $size:expr, $want:expr, $encoded:expr);* $(;)?) => {
+            $(
+                #[test]
+                fn $test_name() {
+                    let mut slice = $encoded.as_slice();
+                    let got = decode_unchecked(&mut slice);
+                    assert_eq!(got, $want);
+                    assert_eq!(slice.len(), $encoded.len() - $size);
+                }
+            )*
+        }
+    }
+
+    check_decode! {
+        // 3 byte encoding.
+        decode_from_3_byte_slice_lower_bound, 3, 0xFD, [0xFD, 0xFD, 0x00];
+        decode_from_3_byte_slice_three_over_lower_bound, 3, 0x0100, [0xFD, 0x00, 0x01];
+        decode_from_3_byte_slice_endianness, 3, 0xABCD, [0xFD, 0xCD, 0xAB];
+        decode_from_3_byte_slice_upper_bound, 3, 0xFFFF, [0xFD, 0xFF, 0xFF];
+
+        // 5 byte encoding.
+        decode_from_5_byte_slice_lower_bound, 5, 0x0001_0000, [0xFE, 0x00, 0x00, 0x01, 0x00];
+        decode_from_5_byte_slice_endianness, 5, 0x0123_4567, [0xFE, 0x67, 0x45, 0x23, 0x01];
+        decode_from_5_byte_slice_upper_bound, 5, 0xFFFF_FFFF, [0xFE, 0xFF, 0xFF, 0xFF, 0xFF];
+        // 9 byte encoding.
+        decode_from_9_byte_slice_lower_bound, 9, 0x0000_0001_0000_0000, [0xFF, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00];
+        decode_from_9_byte_slice_endianness, 9, 0x0123_4567_89AB_CDEF, [0xFF, 0xEF, 0xCD, 0xAB, 0x89, 0x67, 0x45, 0x23, 0x01];
+        decode_from_9_byte_slice_upper_bound, 9, u64::MAX, [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+
+        // Check slices that are bigger than the actual encoding.
+        decode_1_byte_from_bigger_slice, 1, 32, [0x20, 0xAB, 0xBC];
+        decode_3_byte_from_bigger_slice, 3, 0xFFFF, [0xFD, 0xFF, 0xFF, 0xAB, 0xBC];
+        decode_5_byte_from_bigger_slice, 5, 0xFFFF_FFFF, [0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0xAB, 0xBC];
+        decode_9_byte_from_bigger_slice, 9, u64::MAX, [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xAB, 0xBC];
+    }
+
+    #[test]
+    #[should_panic(expected = "tried to decode an empty slice")]
+    fn decode_from_empty_slice_panics() {
+        let mut slice = [].as_slice();
+        let _ = decode_unchecked(&mut slice);
+    }
+
+    #[test]
+    #[should_panic(expected = "slice too short, expected at least 5 bytes")]
+    // Non-minimal is referred to as non-canonical in Core (`bitcoin/src/serialize.h`).
+    fn decode_non_minimal_panics() {
+        let mut slice = [0xFE, 0xCD, 0xAB].as_slice();
+        let _ = decode_unchecked(&mut slice);
+    }
+
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn test_dos_protection() {
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(&[0xFE, 0x00, 0x09, 0x3D, 0x00]); // 4_000_000 (witness count)
+        encoded.extend_from_slice(&[0xFE, 0x00, 0x09, 0x3D, 0x00]); // 4_000_000 (1st element length)
+
+        let mut slice = encoded.as_slice();
+        let mut dec = WitnessDecoder::new();
+
+        assert!(dec.push_bytes(&mut slice).unwrap().needs_more());
+
+        // Only the 1st element length prefix has been written to the content area.
+        // No massive allocation occurred.
+        assert_eq!(dec.content.len(), 5);
+        assert!(dec.content.capacity() < 100_000);
+    }
+}

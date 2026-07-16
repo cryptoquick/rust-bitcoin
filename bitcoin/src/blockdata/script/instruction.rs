@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
-use crate::blockdata::opcodes::{self, Opcode};
-use crate::blockdata::script::{read_uint_iter, Error, PushBytes, Script, ScriptBuf, UintError};
+use internals::script::{self, PushDataLenLen};
+
+use super::{Error, PushBytes, PushBytesExt as _, Script, ScriptBufExtPriv as _};
+use crate::opcodes::{self, Opcode, OpcodeExt as _};
 
 /// A "parsed opcode" which allows iterating over a [`Script`] in a more sensible way.
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
@@ -12,7 +14,7 @@ pub enum Instruction<'a> {
     Op(Opcode),
 }
 
-impl<'a> Instruction<'a> {
+impl Instruction<'_> {
     /// Returns the opcode if the instruction is not a data push.
     pub fn opcode(&self) -> Option<Opcode> {
         match self {
@@ -29,7 +31,7 @@ impl<'a> Instruction<'a> {
         }
     }
 
-    /// Returns the number interpretted by the script parser
+    /// Returns the number interpreted by the script parser
     /// if it can be coerced into a number.
     ///
     /// This does not require the script num to be minimal.
@@ -45,12 +47,8 @@ impl<'a> Instruction<'a> {
                     _ => None,
                 }
             }
-            Instruction::PushBytes(bytes) => {
-                match super::read_scriptint_non_minimal(bytes.as_bytes()) {
-                    Ok(v) => Some(v),
-                    _ => None,
-                }
-            }
+            Instruction::PushBytes(bytes) =>
+                super::read_scriptint_non_minimal(bytes.as_bytes()).ok().map(i64::from),
         }
     }
 
@@ -58,7 +56,28 @@ impl<'a> Instruction<'a> {
     pub(super) fn script_serialized_len(&self) -> usize {
         match self {
             Instruction::Op(_) => 1,
-            Instruction::PushBytes(bytes) => ScriptBuf::reserved_len_for_slice(bytes.len()),
+            // The use of `ScriptSigBuf` here is arbitrary. Rust insists that we pick
+            // a specific tagged script type.
+            Instruction::PushBytes(bytes) =>
+                super::ScriptSigBuf::reserved_len_for_slice(bytes.len()),
+        }
+    }
+
+    /// Reads an integer from an Instruction,
+    /// returning Some(i64) for valid opcodes or pushed bytes, otherwise None
+    pub fn read_int(&self) -> Option<i64> {
+        match self {
+            Instruction::Op(op) => {
+                let v = op.to_u8();
+                match v {
+                    // OP_PUSHNUM_1 ..= OP_PUSHNUM_16
+                    0x51..=0x60 => Some(v as i64 - 0x50),
+                    // OP_PUSHNUM_NEG1
+                    0x4f => Some(-1),
+                    _ => None,
+                }
+            }
+            Instruction::PushBytes(bytes) => bytes.read_cltv_scriptint().ok(),
         }
     }
 }
@@ -74,7 +93,10 @@ impl<'a> Instructions<'a> {
     /// Views the remaining script as a slice.
     ///
     /// This is analogous to what [`core::str::Chars::as_str`] does.
-    pub fn as_script(&self) -> &'a Script { Script::from_bytes(self.data.as_slice()) }
+    pub fn as_script<T>(&self) -> &'a Script<T> { Script::from_bytes(self.data.as_slice()) }
+
+    /// The number of remaining bytes in the script.
+    fn remaining_bytes(&self) -> usize { self.data.as_slice().len() }
 
     /// Sets the iterator to end so that it won't iterate any longer.
     pub(super) fn kill(&mut self) {
@@ -106,13 +128,9 @@ impl<'a> Instructions<'a> {
         len: PushDataLenLen,
         min_push_len: usize,
     ) -> Option<Result<Instruction<'a>, Error>> {
-        let n = match read_uint_iter(&mut self.data, len as usize) {
+        let n = match script::read_push_data_len(&mut self.data, len) {
             Ok(n) => n,
-            // We do exhaustive matching to not forget to handle new variants if we extend
-            // `UintError` type.
-            // Overflow actually means early end of script (script is definitely shorter
-            // than `usize::MAX`)
-            Err(UintError::EarlyEndOfScript) | Err(UintError::NumericOverflow) => {
+            Err(_) => {
                 self.kill();
                 return Some(Err(Error::EarlyEndOfScript));
             }
@@ -128,15 +146,6 @@ impl<'a> Instructions<'a> {
             .map(Instruction::PushBytes);
         Some(result)
     }
-}
-
-/// Allowed length of push data length.
-///
-/// This makes it easier to prove correctness of `next_push_data_len`.
-pub(super) enum PushDataLenLen {
-    One = 1,
-    Two = 2,
-    Four = 4,
 }
 
 impl<'a> Iterator for Instructions<'a> {
@@ -181,7 +190,7 @@ impl<'a> Iterator for Instructions<'a> {
 
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        if self.data.len() == 0 {
+        if self.data.as_slice().is_empty() {
             (0, Some(0))
         } else {
             // There will not be more instructions than bytes
@@ -190,7 +199,7 @@ impl<'a> Iterator for Instructions<'a> {
     }
 }
 
-impl<'a> core::iter::FusedIterator for Instructions<'a> {}
+impl core::iter::FusedIterator for Instructions<'_> {}
 
 /// Iterator over script instructions with their positions.
 ///
@@ -208,14 +217,14 @@ impl<'a> InstructionIndices<'a> {
     ///
     /// This is analogous to what [`core::str::Chars::as_str`] does.
     #[inline]
-    pub fn as_script(&self) -> &'a Script { self.instructions.as_script() }
+    pub fn as_script<T>(&self) -> &'a Script<T> { self.instructions.as_script() }
 
-    /// Creates `Self` setting `pos` to 0.
+    /// Constructs a new `Self` setting `pos` to 0.
     pub(super) fn from_instructions(instructions: Instructions<'a>) -> Self {
         InstructionIndices { instructions, pos: 0 }
     }
 
-    pub(super) fn remaining_bytes(&self) -> usize { self.instructions.as_script().len() }
+    pub(super) fn remaining_bytes(&self) -> usize { self.instructions.remaining_bytes() }
 
     /// Modifies the iterator using `next_fn` returning the next item.
     ///
@@ -228,7 +237,7 @@ impl<'a> InstructionIndices<'a> {
         let prev_remaining = self.remaining_bytes();
         let prev_pos = self.pos;
         let instruction = next_fn(self)?;
-        // No underflow: there must be less remaining bytes now than previously
+        // No overflow: there must be less remaining bytes now than previously
         let consumed = prev_remaining - self.remaining_bytes();
         // No overflow: sum will never exceed slice length which itself can't exceed `usize`
         self.pos += consumed;
@@ -244,11 +253,6 @@ impl<'a> Iterator for InstructionIndices<'a> {
 
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) { self.instructions.size_hint() }
-
-    // the override avoids computing pos multiple times
-    fn nth(&mut self, n: usize) -> Option<Self::Item> {
-        self.next_with(|this| this.instructions.nth(n))
-    }
 }
 
 impl core::iter::FusedIterator for InstructionIndices<'_> {}

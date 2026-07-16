@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 
+# Sort order is affected by locale. See `man sort`.
+# > Set LC_ALL=C to get the traditional sort order that uses native byte values.
+export LC_ALL=C
+
 REPO_DIR=$(git rev-parse --show-toplevel)
 
 listTargetFiles() {
@@ -16,20 +20,6 @@ targetFileToName() {
     | sed 's/^_//g'
 }
 
-targetFileToHFuzzInputArg() {
-  baseName=$(basename "$1")
-  dirName="${baseName%.*}"
-  if [ -d "hfuzz_input/$dirName" ]; then
-    echo "HFUZZ_INPUT_ARGS=\"-f hfuzz_input/$FILE/input\""
-  fi
-}
-
-listTargetNames() {
-  for target in $(listTargetFiles); do
-    targetFileToName "$target"
-  done
-}
-
 # Utility function to avoid CI failures on Windows
 checkWindowsFiles() {
   incorrectFilenames=$(find . -type f -name "*,*" -o -name "*:*" -o -name "*<*" -o -name "*>*" -o -name "*|*" -o -name "*\?*" -o -name "*\**" -o -name "*\"*" | wc -l)
@@ -39,13 +29,16 @@ checkWindowsFiles() {
   fi
 }
 
-# Checks whether a fuzz case output some report, and dumps it in hex
+# Checks whether a fuzz case has artifacts, and dumps them in hex
 checkReport() {
-  reportFile="hfuzz_workspace/$1/HONGGFUZZ.REPORT.TXT"
-  if [ -f "$reportFile" ]; then
-    cat "$reportFile"
-    for CASE in "hfuzz_workspace/$1/SIG"*; do
-      xxd -p -c10000 < "$CASE"
+  artifactDir="fuzz/artifacts/$1"
+  if [ -d "$artifactDir" ] && [ -n "$(ls -A "$artifactDir" 2>/dev/null)" ]; then
+    echo "Artifacts found for target: $1"
+    for artifact in "$artifactDir"/*; do
+      if [ -f "$artifact" ]; then
+        echo "Artifact: $(basename "$artifact")"
+        xxd -p -c10000 < "$artifact"
+      fi
     done
     exit 1
   fi

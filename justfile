@@ -1,34 +1,47 @@
-default:
+alias ulf := update-lock-files
+
+_default:
   @just --list
 
-# Cargo build everything.
-build:
-  cargo build --workspace --all-targets --all-features
+# Install necessary dev tools on system.
+[group('system')]
+tools:
+  @{{justfile_directory()}}/contrib/ensure-maintainer-tools.sh
 
-# Cargo check everything.
-check:
-  cargo check --workspace --all-targets --all-features
+# Install workspace toolchains.
+[group('system')]
+@toolchains: tools
+  RBMT_LOG_LEVEL=quiet cargo rbmt toolchains > /dev/null
 
-# Lint everything.
-lint:
-  cargo +$(cat ./nightly-version) clippy --workspace --all-targets --all-features -- --deny warnings
+# Setup rbmt and run with given args.
+@rbmt *args: toolchains
+  RBMT_LOG_LEVEL=quiet cargo rbmt {{args}}
 
-# Check the formatting
-format:
-  cargo +$(cat ./nightly-version) fmt --all --check
+# Format workspace.
+@fmt: (rbmt "fmt")
 
-# Quick and dirty CI useful for pre-push checks.
-sane: lint
-  cargo test --quiet --workspace --all-targets --no-default-features > /dev/null || exit 1
-  cargo test --quiet --workspace --all-targets > /dev/null || exit 1
-  cargo test --quiet --workspace --all-targets --all-features > /dev/null || exit 1
-
-  # doctests don't get run from workspace root with `cargo test`.
-  cargo test --quiet --workspace --doc || exit 1
-
-  # Make an attempt to catch feature gate problems in doctests
-  cargo test --manifest-path bitcoin/Cargo.toml --doc --no-default-features > /dev/null || exit 1
+# Check for API changes.
+check-api: (rbmt "api")
 
 # Update the recent and minimal lock files.
-update-lock-files:
-  contrib/update-lock-files.sh
+@update-lock-files: (rbmt "lock")
+
+# Query the current API.
+[group('scripts')]
+@query-api crate command:
+ {{justfile_directory()}}/contrib/api.sh $1 $2
+
+# Install githooks.
+[group('scripts')]
+githooks-install:
+ {{justfile_directory()}}/contrib/copy-githooks.sh
+
+# Remove githooks.
+[group('scripts')]
+githooks-remove:
+ {{justfile_directory()}}/contrib/copy-githooks.sh -r
+
+# Generate a dependency tree for workspace crates.
+[group('scripts')]
+gen-dep-tree:
+  {{justfile_directory()}}/contrib/gen-dep-tree.sh

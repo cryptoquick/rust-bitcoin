@@ -2,168 +2,228 @@
 
 //! # Rust Bitcoin Library
 //!
-//! This is a library that supports the Bitcoin network protocol and associated
-//! primitives. It is designed for Rust programs built to work with the Bitcoin
-//! network.
+//! This is a library that supports the Bitcoin network protocol and associated primitives. It is
+//! designed for Rust programs built to work with the Bitcoin network.
 //!
-//! Except for its dependency on libsecp256k1 (and optionally libbitcoinconsensus),
-//! this library is written entirely in Rust. It illustrates the benefits of
-//! strong type safety, including ownership and lifetime, for financial and/or cryptographic software.
+//! Except for its dependency on libsecp256k1 (and optionally libbitcoinconsensus), this library is
+//! written entirely in Rust. It illustrates the benefits of strong type safety, including ownership
+//! and lifetime, for financial and/or cryptographic software.
 //!
-//! See README.md for detailed documentation about development and supported
-//! environments.
+//! See README.md for detailed documentation about development and supported environments.
 //!
-//! ## Available feature flags
+//! # Cargo features
 //!
-//! * `std` - the usual dependency on `std` (default).
-//! * `secp-recovery` - enables calculating public key from a signature and message.
-//! * `base64` - (dependency), enables encoding of PSBTs and message signatures.
-//! * `rand` - (dependency), makes it more convenient to generate random values.
-//! * `serde` - (dependency), implements `serde`-based serialization and
-//!                 deserialization.
+//! * `arbitrary` (dependency) - arbitrary type implementations for testing.
+//! * `base64` (dependency) - enables encoding of PSBTs and message signatures.
+//! * `bitcoinconsensus` (dependency) - enables validating scripts and transactions.
+//! * `default` - enables `std` and `secp-recovery`.
+//! * `rand` (transitive dependency) - makes it more convenient to generate random values.
+//! * `serde` (dependency) - implements `serde`-based serialization and deserialization.
 //! * `secp-lowmemory` - optimizations for low-memory devices.
-//! * `bitcoinconsensus-std` - enables `std` in `bitcoinconsensus` and communicates it
-//!                            to this crate so it knows how to implement
-//!                            `std::error::Error`. At this time there's a hack to
-//!                            achieve the same without this feature but it could
-//!                            happen the implementations diverge one day.
-//! * `ordered` - (dependency), adds implementations of `ArbitraryOrdOrd` to some structs.
+//! * `secp-recovery` - enables calculating public key from a signature and message.
+//! * `std` - the usual dependency on `std`.
 
-#![cfg_attr(all(not(feature = "std"), not(test)), no_std)]
+#![no_std]
 // Experimental features we need.
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
-#![cfg_attr(bench, feature(test))]
+#![cfg_attr(docsrs, feature(doc_notable_trait))]
 // Coding conventions.
 #![warn(missing_docs)]
-// Instead of littering the codebase for non-fuzzing code just globally allow.
+#![warn(deprecated_in_future)]
+#![doc(test(attr(warn(unused))))]
+// Instead of littering the codebase for non-fuzzing and bench code just globally allow.
 #![cfg_attr(fuzzing, allow(dead_code, unused_imports))]
 // Exclude lints we don't think are valuable.
 #![allow(clippy::needless_question_mark)] // https://github.com/rust-bitcoin/rust-bitcoin/pull/2134
 #![allow(clippy::manual_range_contains)] // More readable than clippy's format.
-#![allow(clippy::needless_borrows_for_generic_args)] // https://github.com/rust-lang/rust-clippy/issues/12454
-// For 0.32.x releases only.
-#![allow(deprecated)]
+#![allow(clippy::incompatible_msrv)] // Has FPs and we're testing it which is more reliable anyway.
+#![allow(clippy::uninlined_format_args)] // Allow `format!("{}", x)` instead of enforcing `format!("{x}")`
 
-// Disable 16-bit support at least for now as we can't guarantee it yet.
-#[cfg(target_pointer_width = "16")]
-compile_error!(
-    "rust-bitcoin currently only supports architectures with pointers wider than 16 bits, let us
-    know if you want 16-bit support. Note that we do NOT guarantee that we will implement it!"
+// We only support machines with index size of 4 bytes or more.
+//
+// Bitcoin consensus code relies on being able to have containers with more than 65536 (2^16)
+// entries in them so we cannot support consensus logic on machines that only have 16-bit memory
+// addresses.
+//
+// We specifically do not use `target_pointer_width` because of the possibility that pointer width
+// does not equal index size.
+//
+// ref: https://github.com/rust-bitcoin/rust-bitcoin/pull/2929#discussion_r1661848565
+internals::const_assert!(
+    core::mem::size_of::<usize>() >= 4;
+    "platforms that have usize less than 32 bits are not supported"
 );
-
-#[cfg(bench)]
-extern crate test;
 
 #[macro_use]
 extern crate alloc;
 
-#[cfg(feature = "base64")]
-/// Encodes and decodes base64 as bytes or utf8.
-pub extern crate base64;
+#[cfg(feature = "std")]
+extern crate std;
 
-/// Bitcoin base58 encoding and decoding.
+#[cfg(feature = "arbitrary")]
+pub extern crate arbitrary;
+
+pub extern crate addresses;
 pub extern crate base58;
-
-/// Re-export the `bech32` crate.
+#[cfg(feature = "base64")]
+pub extern crate base64;
 pub extern crate bech32;
-
-/// Rust implementation of cryptographic hash function algorithms.
+pub extern crate encoding;
 pub extern crate hashes;
-
-/// Re-export the `hex-conservative` crate.
 pub extern crate hex;
-
-/// Re-export the `bitcoin-io` crate.
 pub extern crate io;
-
-/// Re-export the `ordered` crate.
-#[cfg(feature = "ordered")]
-pub extern crate ordered;
-
-/// Rust wrapper library for Pieter Wuille's libsecp256k1.  Implements ECDSA and BIP 340 signatures
-/// for the SECG elliptic curve group secp256k1 and related utilities.
+pub extern crate primitives;
 pub extern crate secp256k1;
 
 #[cfg(feature = "serde")]
 #[macro_use]
-extern crate actual_serde as serde;
+pub extern crate serde;
 
-#[cfg(test)]
-#[macro_use]
-mod test_macros;
 mod internal_macros;
-#[cfg(feature = "serde")]
-mod serde_utils;
 
-#[macro_use]
-pub mod p2p;
+include!("../include/array_newtype.rs");
+include!("../include/newtype.rs"); // Explained in `REPO_DIR/docs/README.md`.
+
+pub mod ext {
+    //! Re-export all the extension traits so downstream can use wildcard imports.
+    //!
+    //! As part of stabilizing `primitives` and `units` we created a bunch of extension traits in
+    //! `rust-bitcoin` to hold all the API that we are not yet ready to stabilize. This module
+    //! re-exports all of them to improve ergonomics for users comfortable with wildcard imports.
+    //!
+    //! # Examples
+    //!
+    //! ```
+    //! # #![allow(unused_imports)] // Because that is what we are demoing.
+    //! // Wildcard import all of the extension traits.
+    //! use bitcoin::ext::*;
+    //!
+    //! // If, for some reason, you want the name to be in scope access it via the module. E.g.
+    //! use bitcoin::script::ScriptSigExt;
+    //! ```
+    #[rustfmt::skip] // Use terse custom grouping.
+    pub use crate::{
+        block::{BlockCheckedExt as _, HeaderExt as _},
+        key::{FullPublicKeyExt as _, LegacyPublicKeyExt as _},
+        network::NetworkExt as _,
+        opcodes::OpcodeExt as _,
+        pow::{CompactTargetExt as _, TargetExt as _, WorkExt as _},
+        script::{BuilderExt as _, PushBytesExt as _, ScriptExt as _, ScriptBufExt as _, TapScriptExt as _, ScriptPubKeyExt as _, ScriptPubKeyBufExt as _, WitnessScriptExt as _, ScriptSigExt as _},
+        taproot::{TapLeafHashExt as _, TapNodeHashExt as _},
+        transaction::{TxidExt as _, WtxidExt as _, OutPointExt as _, TxInExt as _, TxOutExt as _, TransactionExt as _},
+        witness::WitnessExt as _,
+    };
+    #[cfg(feature = "bitcoinconsensus")]
+    pub use crate::consensus_validation::{ScriptPubKeyExt as _, TransactionExt as _};
+}
 pub mod address;
-pub mod bip152;
 pub mod bip158;
-pub mod bip32;
 pub mod blockdata;
-pub mod consensus;
+#[cfg(feature = "bitcoinconsensus")]
+pub mod consensus_validation;
 // Private until we either make this a crate or flatten it - still to be decided.
 pub(crate) mod crypto;
-pub mod error;
 pub mod hash_types;
 pub mod merkle_tree;
 pub mod network;
 pub mod p2mr;
 pub mod policy;
 pub mod pow;
-pub mod psbt;
 pub mod sign_message;
 pub mod taproot;
 
-#[rustfmt::skip]                // Keep public re-exports separate.
+// Re-export the type from where it is defined but the module from the highest place up the stack
+// that it is available in the event that we add some functionality there.
+#[doc(inline)]
+pub use primitives::{
+    block::{
+        compute_merkle_root, compute_witness_root, Block, BlockHash, Checked as BlockChecked,
+        Header as BlockHeader, InvalidBlockError, Unchecked as BlockUnchecked,
+        Validation as BlockValidation, Version as BlockVersion, WitnessCommitment,
+    },
+    merkle_tree::{TxMerkleNode, WitnessMerkleNode},
+    script::{
+        RedeemScript, RedeemScriptBuf, RedeemScriptTag, ScriptHashableTag, ScriptPubKey,
+        ScriptPubKeyBuf, ScriptPubKeyTag, ScriptSig, ScriptSigBuf, ScriptSigTag, SignetBlockScript,
+        SignetBlockScriptBuf, SignetBlockScriptTag, Tag, TapScript, TapScriptBuf, TapScriptTag,
+        WitnessScript, WitnessScriptBuf, WitnessScriptTag,
+    },
+    transaction::{OutPoint, Transaction, TxIn, TxOut, Txid, Version as TransactionVersion, Wtxid},
+    witness::Witness,
+};
+#[doc(inline)]
+pub use units::{
+    amount::{Amount, SignedAmount},
+    block::{BlockHeight, BlockHeightInterval, BlockMtp, BlockMtpInterval},
+    fee_rate::FeeRate,
+    parse_int,
+    pow::CompactTarget,
+    result::{self, NumOpResult},
+    sequence::{self, Sequence},
+    time::{self, BlockTime, BlockTimeDecoder, BlockTimeDecoderError},
+    weight::Weight,
+};
+
+#[deprecated(since = "TBD", note = "use `BlockHeightInterval` instead")]
+#[doc(hidden)]
+pub type BlockInterval = BlockHeightInterval;
+
+#[deprecated(since = "TBD", note = "use `FullPublicKey` instead")]
+#[doc(hidden)]
+pub type CompressedPublicKey = FullPublicKey;
+
+#[deprecated(since = "TBD", note = "use `LegacyPublicKey` instead")]
+#[doc(hidden)]
+pub type PublicKey = LegacyPublicKey;
+
+// Re-export modules directly from lower level crates
+#[doc(inline)]
+pub use key_expression::bip32;
+
 #[doc(inline)]
 pub use crate::{
     address::{Address, AddressType, KnownHrp},
-    amount::{Amount, Denomination, SignedAmount},
-    bip158::{FilterHash, FilterHeader},
     bip32::XKeyIdentifier,
-    blockdata::block::{self, Block, BlockHash, TxMerkleNode, WitnessMerkleNode, WitnessCommitment},
-    blockdata::constants,
-    blockdata::fee_rate::FeeRate,
-    blockdata::locktime::{self, absolute, relative},
+    crypto::ecdsa,
+    crypto::key::{
+        self, FullPublicKey, Keypair, LegacyPublicKey, PrivateKey, WifKey, XOnlyPublicKey,
+    },
+    crypto::sighash::{self, LegacySighash, SegwitV0Sighash, TapSighash, TapSighashTag},
+    network::params::{self, Params},
+    network::{Network, NetworkKind, TestnetVersion},
+    p2mr::{P2mrBuilder, P2mrControlBlock, P2mrError, P2mrScriptBuf, P2mrSpendInfo},
+    pow::{Target, Work},
+    sighash::{EcdsaSighashType, TapSighashType},
+    taproot::{TapBranchTag, TapLeafHash, TapLeafTag, TapNodeHash, TapTweakHash, TapTweakTag},
+};
+// Re-export all modules from `blockdata`, users should never need to use `blockdata` directly.
+#[doc(inline)]
+pub use crate::{
+    // Also, re-export types and modules from `blockdata` that don't come from `primitives`.
+    blockdata::locktime::{absolute, relative},
     blockdata::opcodes::{self, Opcode},
     blockdata::script::witness_program::{self, WitnessProgram},
     blockdata::script::witness_version::{self, WitnessVersion},
-    blockdata::script::{self, Script, ScriptBuf, ScriptHash, WScriptHash},
-    blockdata::transaction::{self, OutPoint, Sequence, Transaction, TxIn, TxOut, Txid, Wtxid},
-    blockdata::weight::Weight,
-    blockdata::witness::{self, Witness},
-    consensus::encode::VarInt,
-    consensus::params,
-    crypto::ecdsa,
-    crypto::key::{self, PrivateKey, PubkeyHash, PublicKey, CompressedPublicKey, WPubkeyHash, XOnlyPublicKey},
-    crypto::sighash::{self, LegacySighash, SegwitV0Sighash, TapSighash, TapSighashTag},
-    merkle_tree::MerkleBlock,
-    network::{Network, NetworkKind},
-    pow::{CompactTarget, Target, Work},
-    psbt::Psbt,
-    p2mr::{P2mrBuilder, P2mrScriptBuf, P2mrControlBlock, P2mrSpendInfo, P2mrError},
-    sighash::{EcdsaSighashType, TapSighashType},
-    taproot::{TapBranchTag, TapLeafHash, TapLeafTag, TapNodeHash, TapTweakHash, TapTweakTag},
+    // These modules also re-export all the respective `primitives` types.
+    blockdata::{block, constants, fee_rate, locktime, script, transaction, weight, witness},
 };
 
 #[rustfmt::skip]
 #[allow(unused_imports)]
 mod prelude {
-    #[cfg(all(not(feature = "std"), not(test)))]
+    #[cfg(not(feature = "std"))]
     pub use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::{Borrow, BorrowMut, Cow, ToOwned}, slice, rc};
 
-    #[cfg(all(not(feature = "std"), not(test), any(not(rust_v_1_60), target_has_atomic = "ptr")))]
+    #[cfg(target_has_atomic = "ptr")]
+    #[cfg(not(feature = "std"))]
     pub use alloc::sync;
 
-    #[cfg(any(feature = "std", test))]
+    #[cfg(feature = "std")]
     pub use std::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::{Borrow, BorrowMut, Cow, ToOwned}, rc, sync};
 
-    #[cfg(all(not(feature = "std"), not(test)))]
+    #[cfg(not(feature = "std"))]
     pub use alloc::collections::{BTreeMap, BTreeSet, btree_map, BinaryHeap};
 
-    #[cfg(any(feature = "std", test))]
+    #[cfg(feature = "std")]
     pub use std::collections::{BTreeMap, BTreeSet, btree_map, BinaryHeap};
 
     pub use crate::io::sink;
@@ -174,39 +234,60 @@ mod prelude {
 pub mod amount {
     //! Bitcoin amounts.
     //!
-    //! This module mainly introduces the [Amount] and [SignedAmount] types.
+    //! This module mainly introduces the [`Amount`] and [`SignedAmount`] types.
     //! We refer to the documentation on the types for more information.
 
-    use crate::consensus::{encode, Decodable, Encodable};
-    use crate::io::{Read, Write};
-
     #[rustfmt::skip]            // Keep public re-exports separate.
-    #[doc(inline)]
-    pub use units::amount::{
-        Amount, CheckedSum, Denomination, Display, ParseAmountError, SignedAmount,
-    };
     #[cfg(feature = "serde")]
     pub use units::amount::serde;
+    #[doc(inline)]
+    pub use units::amount::{Amount, AmountDecoder, AmountEncoder, SignedAmount};
+    #[doc(no_inline)]
+    pub use units::amount::{Denomination, Display};
 
-    impl Decodable for Amount {
-        #[inline]
-        fn consensus_decode<R: Read + ?Sized>(r: &mut R) -> Result<Self, encode::Error> {
-            Ok(Amount::from_sat(Decodable::consensus_decode(r)?))
-        }
-    }
+    #[doc(no_inline)]
+    pub use self::error::{
+        AmountDecoderError, BadPositionError, InputTooLargeError, InvalidCharacterError,
+        MissingDenominationError, MissingDigitsError, OutOfRangeError, ParseAmountError,
+        ParseDenominationError, ParseError, PossiblyConfusingDenominationError, TooPreciseError,
+        UnknownDenominationError,
+    };
 
-    impl Encodable for Amount {
-        #[inline]
-        fn consensus_encode<W: Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
-            self.to_sat().consensus_encode(w)
-        }
+    /// Error types for bitcoin amounts.
+    pub mod error {
+        pub use units::amount::error::{
+            AmountDecoderError, BadPositionError, InputTooLargeError, InvalidCharacterError,
+            MissingDenominationError, MissingDigitsError, OutOfRangeError, ParseAmountError,
+            ParseDenominationError, ParseError, PossiblyConfusingDenominationError,
+            TooPreciseError, UnknownDenominationError,
+        };
     }
 }
 
-/// Unit parsing utilities.
-pub mod parse {
-    /// Re-export everything from the [`units::parse`] module.
-    pub use units::parse::ParseIntError;
+/// A conversion trait for unsigned integer types smaller than or equal to 64-bits.
+///
+/// This trait exists because [`usize`] doesn't implement `Into<u64>`. We only support 32 and 64 bit
+/// architectures because of consensus code so we can infallibly do the conversion.
+pub(crate) trait ToU64 {
+    /// Converts unsigned integer type to a [`u64`].
+    fn to_u64(self) -> u64;
 }
 
+macro_rules! impl_to_u64 {
+    ($($ty:ident),*) => {
+        $(
+            impl ToU64 for $ty { fn to_u64(self) -> u64 { self.into() } }
+        )*
+    }
+}
+impl_to_u64!(u8, u16, u32, u64);
 
+impl ToU64 for usize {
+    fn to_u64(self) -> u64 {
+        internals::const_assert!(
+            core::mem::size_of::<usize>() <= 8;
+            "platforms that have usize larger than 64 bits are not supported"
+        );
+        self as u64
+    }
+}

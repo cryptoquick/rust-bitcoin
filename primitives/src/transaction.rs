@@ -1,0 +1,3251 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! Bitcoin transactions.
+//!
+//! A transaction describes a transfer of money. It consumes previously-unspent
+//! transaction outputs and produces new ones, satisfying the condition to spend
+//! the old outputs (typically a digital signature with a specific key must be
+//! provided) and defining the condition to spend the new ones. The use of digital
+//! signatures ensures that coins cannot be spent by unauthorized parties.
+//!
+//! This module provides the structures and functions needed to support transactions.
+
+use core::fmt;
+#[cfg(feature = "alloc")]
+use core::{cmp, mem};
+
+#[cfg(feature = "arbitrary")]
+use arbitrary::{Arbitrary, Unstructured};
+#[cfg(feature = "hex")]
+#[cfg(feature = "alloc")]
+use encoding::FromHexError;
+use encoding::{ArrayEncoder, BytesEncoder, Encoder2};
+#[cfg(feature = "alloc")]
+use encoding::{
+    Decoder2, Decoder3, DecoderStatus, Encode as _, Encoder3, Encoder6, EncoderStatus,
+    PrefixedSliceEncoder, VecDecoder,
+};
+#[cfg(feature = "alloc")]
+use hashes::sha256d;
+use internals::array::ArrayExt as _;
+#[cfg(feature = "serde")]
+use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
+#[cfg(feature = "alloc")]
+#[cfg(feature = "hex")]
+use units::parse_int;
+
+#[cfg(feature = "alloc")]
+use self::error::TransactionDecoderErrorInner;
+#[cfg(feature = "alloc")]
+use crate::amount::{AmountDecoder, AmountEncoder};
+#[cfg(feature = "alloc")]
+#[cfg(feature = "hex")]
+use crate::hex_codec::HexPrimitive;
+#[cfg(feature = "alloc")]
+use crate::locktime::absolute::{LockTimeDecoder, LockTimeEncoder};
+#[cfg(feature = "alloc")]
+use crate::prelude::Vec;
+#[cfg(feature = "alloc")]
+use crate::script::{ScriptEncoder, ScriptPubKeyBufDecoder, ScriptSigBufDecoder};
+#[cfg(feature = "alloc")]
+use crate::sequence::{SequenceDecoder, SequenceEncoder};
+#[cfg(feature = "alloc")]
+use crate::witness::{WitnessDecoder, WitnessEncoder};
+#[cfg(feature = "alloc")]
+use crate::{absolute, Amount, ScriptPubKeyBuf, ScriptSigBuf, Sequence, Weight, Witness};
+
+#[rustfmt::skip]            // Keep public re-exports separate.
+#[cfg(feature = "hex")]
+#[cfg(feature = "alloc")]
+#[doc(no_inline)]
+pub use self::error::ParseOutPointError;
+#[doc(no_inline)]
+pub use self::error::{OutPointDecoderError, VersionDecoderError};
+#[cfg(feature = "alloc")]
+#[doc(no_inline)]
+pub use self::error::{TransactionDecoderError, TxInDecoderError, TxOutDecoderError};
+#[doc(no_inline)]
+pub use crate::hash_types::BlockHashDecoderError;
+#[doc(inline)]
+pub use crate::hash_types::{BlockHashDecoder, Ntxid, Txid, Wtxid};
+
+/// Bitcoin transaction.
+///
+/// An authenticated movement of coins.
+///
+/// See [Bitcoin Wiki: Transaction][wiki-transaction] for more information.
+///
+/// [wiki-transaction]: https://en.bitcoin.it/wiki/Transaction
+///
+/// # Bitcoin Core References
+///
+/// * [CTransaction definition](https://github.com/bitcoin/bitcoin/blob/345457b542b6a980ccfbc868af0970a6f91d1b82/src/primitives/transaction.h#L279)
+///
+/// # Serialization notes
+///
+/// If any inputs have nonempty witnesses, the entire transaction is serialized
+/// in the post-BIP-0141 SegWit format which includes a list of witnesses. If all
+/// inputs have empty witnesses, the transaction is serialized in the pre-BIP-0141
+/// format.
+///
+/// There is one major exception to this: to avoid deserialization ambiguity,
+/// if the transaction has no inputs, it is serialized in the BIP-0141 style. Be
+/// aware that this differs from the transaction format in PSBT, which _never_
+/// uses BIP-0141. (Ordinarily there is no conflict, since in PSBT transactions
+/// are always unsigned and therefore their inputs have empty witnesses.)
+///
+/// The specific ambiguity is that SegWit uses the flag bytes `0001` where an old
+/// serializer would read the number of transaction inputs. The old serializer
+/// would interpret this as "no inputs, one output", which means the transaction
+/// is invalid, and simply reject it. SegWit further specifies that this encoding
+/// should *only* be used when some input has a nonempty witness; that is,
+/// witness-less transactions should be encoded in the traditional format.
+///
+/// However, in protocols where transactions may legitimately have 0 inputs, e.g.
+/// when parties are cooperatively funding a transaction, the "00 means SegWit"
+/// heuristic does not work. Since SegWit requires such a transaction to be encoded
+/// in the original transaction format (since it has no inputs and therefore
+/// no input witnesses), a traditionally encoded transaction may have the `0001`
+/// SegWit flag in it, which confuses most SegWit parsers including the one in
+/// Bitcoin Core.
+///
+/// We therefore deviate from the spec by always using the SegWit witness encoding
+/// for 0-input transactions, which results in unambiguously parseable transactions.
+///
+/// # A note on ordering
+///
+/// This type implements `Ord`, even though it contains a locktime, which is not
+/// itself `Ord`. This was done to simplify applications that may need to hold
+/// transactions inside a sorted container. We have ordered the locktimes based
+/// on their representation as a `u32`, which is not a semantically meaningful
+/// order, and therefore the ordering on `Transaction` itself is not semantically
+/// meaningful either.
+///
+/// The ordering is, however, consistent with the ordering present in this library
+/// before this change, so users should not notice any breakage (here) when
+/// transitioning from 0.29 to 0.30.
+#[derive(Clone, PartialEq, Eq, Debug, Hash)]
+#[cfg(feature = "alloc")]
+pub struct Transaction {
+    /// The protocol version. This is currently expected to be 1, 2 (BIP-0068) or 3 (BIP-0431).
+    pub version: Version,
+    /// Block height or timestamp. Transaction cannot be included in a block until this height/time.
+    ///
+    /// # Relevant BIPs
+    ///
+    /// * [BIP-0065 OP_CHECKLOCKTIMEVERIFY](https://github.com/bitcoin/bips/blob/master/bip-0065.mediawiki)
+    /// * [BIP-0113 Median time-past as endpoint for lock-time calculations](https://github.com/bitcoin/bips/blob/master/bip-0113.mediawiki)
+    pub lock_time: absolute::LockTime,
+    /// List of transaction inputs.
+    pub inputs: Vec<TxIn>,
+    /// List of transaction outputs.
+    pub outputs: Vec<TxOut>,
+}
+
+#[cfg(feature = "alloc")]
+impl Transaction {
+    // https://github.com/bitcoin/bitcoin/blob/44b05bf3fef2468783dcebf651654fdd30717e7e/src/policy/policy.h#L27
+    /// Maximum transaction weight for Bitcoin Core 25.0.
+    pub const MAX_STANDARD_WEIGHT: Weight = Weight::from_wu(400_000);
+
+    /// Computes a "normalized TXID" which does not include any signatures.
+    ///
+    /// This function is needed only for legacy (pre-Segwit or P2SH-wrapped segwit version 0)
+    /// applications. This method clears the `script_sig` field of each input, which in Segwit
+    /// transactions is already empty, so for Segwit transactions the ntxid will be equal to the
+    /// txid, and you should simply use the latter.
+    ///
+    /// This gives a way to identify a transaction that is "the same" as another in the sense of
+    /// having the same inputs and outputs.
+    #[doc(alias = "ntxid")]
+    pub fn compute_ntxid(&self) -> Ntxid {
+        let normalized = Self {
+            version: self.version,
+            lock_time: self.lock_time,
+            inputs: self
+                .inputs
+                .iter()
+                .map(|txin| TxIn {
+                    script_sig: ScriptSigBuf::new(),
+                    witness: Witness::default(),
+                    ..*txin
+                })
+                .collect(),
+            outputs: self.outputs.clone(),
+        };
+        Ntxid::from_byte_array(normalized.compute_txid().to_byte_array())
+    }
+
+    /// Computes the [`Txid`].
+    ///
+    /// Hashes the transaction **excluding** the SegWit data (i.e. the marker, flag bytes, and the
+    /// witness fields themselves). For non-SegWit transactions which do not have any SegWit data,
+    /// this will be equal to [`Transaction::compute_wtxid()`].
+    #[doc(alias = "txid")]
+    #[inline]
+    pub fn compute_txid(&self) -> Txid {
+        let hash = hash_transaction(self, false);
+        Txid::from_byte_array(hash.to_byte_array())
+    }
+
+    /// Computes the SegWit version of the transaction id.
+    ///
+    /// Hashes the transaction **including** all SegWit data (i.e. the marker, flag bytes, and the
+    /// witness fields themselves). For non-SegWit transactions which do not have any SegWit data,
+    /// this will be equal to [`Transaction::compute_txid()`].
+    #[doc(alias = "wtxid")]
+    #[inline]
+    pub fn compute_wtxid(&self) -> Wtxid {
+        let hash = hash_transaction(self, self.uses_segwit_serialization());
+        Wtxid::from_byte_array(hash.to_byte_array())
+    }
+
+    /// Returns whether or not to serialize transaction as specified in BIP-0144.
+    // This is duplicated in `bitcoin`, if you change it please do so in both places.
+    #[inline]
+    fn uses_segwit_serialization(&self) -> bool {
+        if self.inputs.iter().any(|input| !input.witness.is_empty()) {
+            return true;
+        }
+        // To avoid serialization ambiguity, no inputs means we use BIP-0141 serialization (see
+        // `Transaction` docs for full explanation).
+        self.inputs.is_empty()
+    }
+
+    /// Checks if this is a coinbase transaction.
+    ///
+    /// The first transaction in the block distributes the mining reward and is called the coinbase
+    /// transaction. It is impossible to check if the transaction is first in the block, so this
+    /// function checks the structure of the transaction instead - the previous output must be
+    /// all-zeros (creates satoshis "out of thin air").
+    #[doc(alias = "is_coin_base")] // method previously had this name
+    pub fn is_coinbase(&self) -> bool {
+        self.inputs.len() == 1 && self.inputs[0].previous_output == OutPoint::COINBASE_PREVOUT
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl cmp::PartialOrd for Transaction {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> { Some(self.cmp(other)) }
+}
+
+#[cfg(feature = "alloc")]
+impl cmp::Ord for Transaction {
+    fn cmp(&self, other: &Self) -> cmp::Ordering {
+        self.version
+            .cmp(&other.version)
+            .then(self.lock_time.to_consensus_u32().cmp(&other.lock_time.to_consensus_u32()))
+            .then(self.inputs.cmp(&other.inputs))
+            .then(self.outputs.cmp(&other.outputs))
+    }
+}
+
+#[cfg(feature = "alloc")]
+#[cfg(feature = "hex")]
+impl core::str::FromStr for Transaction {
+    type Err = FromHexError<TransactionDecoderError>;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> { encoding::decode_from_hex(s) }
+}
+
+#[cfg(feature = "alloc")]
+#[cfg(feature = "hex")]
+impl fmt::Display for Transaction {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        fmt::Display::fmt(&HexPrimitive(self), f)
+    }
+}
+
+#[cfg(feature = "alloc")]
+#[cfg(feature = "hex")]
+impl fmt::LowerHex for Transaction {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        fmt::LowerHex::fmt(&HexPrimitive(self), f)
+    }
+}
+
+#[cfg(feature = "alloc")]
+#[cfg(feature = "hex")]
+impl fmt::UpperHex for Transaction {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        fmt::UpperHex::fmt(&HexPrimitive(self), f)
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl From<Transaction> for Txid {
+    #[inline]
+    fn from(tx: Transaction) -> Self { tx.compute_txid() }
+}
+
+#[cfg(feature = "alloc")]
+impl From<&Transaction> for Txid {
+    #[inline]
+    fn from(tx: &Transaction) -> Self { tx.compute_txid() }
+}
+
+#[cfg(feature = "alloc")]
+impl From<Transaction> for Wtxid {
+    #[inline]
+    fn from(tx: Transaction) -> Self { tx.compute_wtxid() }
+}
+
+#[cfg(feature = "alloc")]
+impl From<&Transaction> for Wtxid {
+    #[inline]
+    fn from(tx: &Transaction) -> Self { tx.compute_wtxid() }
+}
+
+/// Trait that abstracts over a transaction identifier i.e., `Txid` and `Wtxid`.
+pub(crate) trait TxIdentifier: AsRef<[u8]> {}
+
+impl TxIdentifier for Txid {}
+impl TxIdentifier for Wtxid {}
+
+// Duplicated in `bitcoin`.
+/// The marker MUST be a 1-byte zero value: 0x00. (BIP-0141)
+#[cfg(feature = "alloc")]
+const SEGWIT_MARKER: u8 = 0x00;
+/// The flag MUST be a 1-byte non-zero value. Currently, 0x01 MUST be used. (BIP-0141)
+#[cfg(feature = "alloc")]
+const SEGWIT_FLAG: u8 = 0x01;
+
+// This is equivalent to consensus encoding but hashes the fields manually.
+#[cfg(feature = "alloc")]
+fn hash_transaction(tx: &Transaction, uses_segwit_serialization: bool) -> sha256d::Hash {
+    use hashes::HashEngine as _;
+
+    let mut enc = sha256d::Hash::engine();
+    enc.input(&tx.version.0.to_le_bytes()); // Same as `encode::emit_i32`.
+
+    if uses_segwit_serialization {
+        // BIP-0141 (SegWit) transaction serialization also includes marker and flag.
+        enc.input(&[SEGWIT_MARKER]);
+        enc.input(&[SEGWIT_FLAG]);
+    }
+
+    // Encode inputs (excluding witness data) with leading compact size encoded int.
+    let input_len = tx.inputs.len();
+    enc.input(crate::compact_size_encode(input_len).as_slice());
+    for input in &tx.inputs {
+        // Encode each input same as we do in `Encodable for TxIn`.
+        enc.input(input.previous_output.txid.as_byte_array());
+        enc.input(&input.previous_output.vout.to_le_bytes());
+
+        let script_sig_bytes = input.script_sig.as_bytes();
+        enc.input(crate::compact_size_encode(script_sig_bytes.len()).as_slice());
+        enc.input(script_sig_bytes);
+
+        enc.input(&input.sequence.0.to_le_bytes());
+    }
+
+    // Encode outputs with leading compact size encoded int.
+    let output_len = tx.outputs.len();
+    enc.input(crate::compact_size_encode(output_len).as_slice());
+    for output in &tx.outputs {
+        // Encode each output same as we do in `Encodable for TxOut`.
+        enc.input(&output.amount.to_sat().to_le_bytes());
+
+        let script_pubkey_bytes = output.script_pubkey.as_bytes();
+        enc.input(crate::compact_size_encode(script_pubkey_bytes.len()).as_slice());
+        enc.input(script_pubkey_bytes);
+    }
+
+    if uses_segwit_serialization {
+        // BIP-0141 (SegWit) transaction serialization also includes the witness data.
+        for input in &tx.inputs {
+            // Same as `Encodable for Witness`.
+            enc.input(crate::compact_size_encode(input.witness.len()).as_slice());
+            for element in &input.witness {
+                enc.input(crate::compact_size_encode(element.len()).as_slice());
+                enc.input(element);
+            }
+        }
+    }
+
+    // Same as `Encodable for absolute::LockTime`.
+    enc.input(&tx.lock_time.to_consensus_u32().to_le_bytes());
+
+    sha256d::Hash::from_engine(enc)
+}
+
+#[cfg(feature = "alloc")]
+impl encoding::Encode for Transaction {
+    type Encoder<'e>
+        = TransactionEncoder<'e>
+    where
+        Self: 'e;
+
+    fn encoder(&self) -> Self::Encoder<'_> {
+        let version = self.version.encoder();
+        let inputs = PrefixedSliceEncoder::new(self.inputs.as_ref());
+        let outputs = PrefixedSliceEncoder::new(self.outputs.as_ref());
+        let lock_time = self.lock_time.encoder();
+
+        if self.uses_segwit_serialization() {
+            let segwit = ArrayEncoder::without_length_prefix([0x00, 0x01]);
+            let witnesses = WitnessesEncoder::new(self.inputs.as_slice());
+            TransactionEncoder::new(Encoder6::new(
+                version,
+                Some(segwit),
+                inputs,
+                outputs,
+                Some(witnesses),
+                lock_time,
+            ))
+        } else {
+            TransactionEncoder::new(Encoder6::new(version, None, inputs, outputs, None, lock_time))
+        }
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl encoding::Decode for Transaction {
+    type Decoder = TransactionDecoder;
+}
+
+#[cfg(feature = "alloc")]
+type TransactionEncoderInner<'e> = Encoder6<
+    VersionEncoder<'e>,
+    Option<ArrayEncoder<2>>,
+    PrefixedSliceEncoder<'e, TxIn>,
+    PrefixedSliceEncoder<'e, TxOut>,
+    Option<WitnessesEncoder<'e>>,
+    LockTimeEncoder<'e>,
+>;
+
+#[cfg(feature = "alloc")]
+encoding::encoder_newtype! {
+    /// The encoder for the [`Transaction`] type.
+    #[derive(Debug, Clone)]
+    pub struct TransactionEncoder<'e>(TransactionEncoderInner<'e>);
+}
+
+/// The decoder for the [`Transaction`] type.
+#[cfg(feature = "alloc")]
+#[derive(Debug, Clone)]
+pub struct TransactionDecoder {
+    state: TransactionDecoderState,
+}
+
+#[cfg(feature = "alloc")]
+impl TransactionDecoder {
+    /// Constructs a new [`TransactionDecoder`].
+    pub const fn new() -> Self {
+        Self { state: TransactionDecoderState::Version(VersionDecoder::new()) }
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl Default for TransactionDecoder {
+    fn default() -> Self { Self::new() }
+}
+
+#[cfg(feature = "alloc")]
+#[allow(clippy::too_many_lines)] // TODO: Can we clean this up?
+impl encoding::Decoder for TransactionDecoder {
+    type Output = Transaction;
+    type Error = TransactionDecoderError;
+
+    #[inline]
+    fn push_bytes(&mut self, bytes: &mut &[u8]) -> Result<DecoderStatus, Self::Error> {
+        use TransactionDecoderError as E;
+        use TransactionDecoderErrorInner as Inner;
+        use TransactionDecoderState as State;
+
+        loop {
+            // Attempt to push to the currently-active decoder and return early on success.
+            match &mut self.state {
+                State::Version(decoder) => {
+                    if decoder.push_bytes(bytes).map_err(|e| E(Inner::Version(e)))?.needs_more() {
+                        // Still more bytes required.
+                        return Ok(DecoderStatus::NeedsMore);
+                    }
+                }
+                State::Inputs(_, _, decoder) =>
+                    if decoder.push_bytes(bytes).map_err(|e| E(Inner::Inputs(e)))?.needs_more() {
+                        return Ok(DecoderStatus::NeedsMore);
+                    },
+                State::SegwitFlag(_) =>
+                    if bytes.is_empty() {
+                        return Ok(DecoderStatus::NeedsMore);
+                    },
+                State::Outputs(_, _, _, decoder) =>
+                    if decoder.push_bytes(bytes).map_err(|e| E(Inner::Outputs(e)))?.needs_more() {
+                        return Ok(DecoderStatus::NeedsMore);
+                    },
+                State::Witnesses(_, _, _, _, decoder) =>
+                    if decoder.push_bytes(bytes).map_err(|e| E(Inner::Witness(e)))?.needs_more() {
+                        return Ok(DecoderStatus::NeedsMore);
+                    },
+                State::LockTime(_, _, _, decoder) =>
+                    if decoder.push_bytes(bytes).map_err(|e| E(Inner::LockTime(e)))?.needs_more() {
+                        return Ok(DecoderStatus::NeedsMore);
+                    },
+                State::Done(..) => return Ok(DecoderStatus::Ready),
+                State::Errored => panic!("call to push_bytes() after decoder errored"),
+            }
+
+            // If the above failed, end the current decoder and go to the next state.
+            match mem::replace(&mut self.state, State::Errored) {
+                State::Version(decoder) => {
+                    let version = decoder.end().map_err(|e| E(Inner::Version(e)))?;
+                    self.state = State::Inputs(version, Attempt::First, VecDecoder::<TxIn>::new());
+                }
+                State::Inputs(version, attempt, decoder) => {
+                    let inputs = decoder.end().map_err(|e| E(Inner::Inputs(e)))?;
+
+                    if Attempt::First == attempt {
+                        if inputs.is_empty() {
+                            self.state = State::SegwitFlag(version);
+                        } else {
+                            self.state = State::Outputs(
+                                version,
+                                inputs,
+                                IsSegwit::No,
+                                VecDecoder::<TxOut>::new(),
+                            );
+                        }
+                    } else {
+                        self.state = State::Outputs(
+                            version,
+                            inputs,
+                            IsSegwit::Yes,
+                            VecDecoder::<TxOut>::new(),
+                        );
+                    }
+                }
+                State::SegwitFlag(version) => {
+                    let segwit_flag = bytes[0];
+                    *bytes = &bytes[1..];
+
+                    if segwit_flag != 1 {
+                        return Err(E(Inner::UnsupportedSegwitFlag(segwit_flag)));
+                    }
+                    self.state = State::Inputs(version, Attempt::Second, VecDecoder::<TxIn>::new());
+                }
+                State::Outputs(version, inputs, is_segwit, decoder) => {
+                    let outputs = decoder.end().map_err(|e| E(Inner::Outputs(e)))?;
+                    // Handle the zero-input case described in the `Transaction` docs.
+                    if is_segwit == IsSegwit::Yes && !inputs.is_empty() {
+                        self.state = State::Witnesses(
+                            version,
+                            inputs,
+                            outputs,
+                            Iteration(0),
+                            WitnessDecoder::new(),
+                        );
+                    } else {
+                        self.state =
+                            State::LockTime(version, inputs, outputs, LockTimeDecoder::new());
+                    }
+                }
+                State::Witnesses(version, mut inputs, outputs, iteration, decoder) => {
+                    let iteration = iteration.0;
+
+                    inputs[iteration].witness = decoder.end().map_err(|e| E(Inner::Witness(e)))?;
+                    if iteration < inputs.len() - 1 {
+                        self.state = State::Witnesses(
+                            version,
+                            inputs,
+                            outputs,
+                            Iteration(iteration + 1),
+                            WitnessDecoder::new(),
+                        );
+                    } else {
+                        if !inputs.is_empty() && inputs.iter().all(|input| input.witness.is_empty())
+                        {
+                            return Err(E(Inner::NoWitnesses));
+                        }
+                        self.state =
+                            State::LockTime(version, inputs, outputs, LockTimeDecoder::new());
+                    }
+                }
+                State::LockTime(version, inputs, outputs, decoder) => {
+                    let lock_time = decoder.end().map_err(|e| E(Inner::LockTime(e)))?;
+                    self.state = State::Done(Transaction { version, lock_time, inputs, outputs });
+                    return Ok(DecoderStatus::Ready);
+                }
+                State::Done(..) => return Ok(DecoderStatus::Ready),
+                State::Errored => unreachable!("checked above"),
+            }
+        }
+    }
+
+    #[inline]
+    fn end(self) -> Result<Self::Output, Self::Error> {
+        use TransactionDecoderError as E;
+        use TransactionDecoderErrorInner as Inner;
+        use TransactionDecoderState as State;
+
+        match self.state {
+            State::Version(_) => Err(E(Inner::EarlyEnd("version"))),
+            State::Inputs(..) => Err(E(Inner::EarlyEnd("inputs"))),
+            State::SegwitFlag(..) => Err(E(Inner::EarlyEnd("segwit flag"))),
+            State::Outputs(..) => Err(E(Inner::EarlyEnd("outputs"))),
+            State::Witnesses(..) => Err(E(Inner::EarlyEnd("witnesses"))),
+            State::LockTime(..) => Err(E(Inner::EarlyEnd("locktime"))),
+            State::Done(tx) => {
+                // Reject transactions with no outputs
+                if tx.outputs.is_empty() {
+                    return Err(E(Inner::NoOutputs));
+                }
+                // check for null prevout in non-coinbase txs
+                if tx.inputs.len() > 1 {
+                    for (index, input) in tx.inputs.iter().enumerate() {
+                        if input.previous_output == OutPoint::COINBASE_PREVOUT {
+                            return Err(E(Inner::NullPrevoutInNonCoinbase(index)));
+                        }
+                    }
+                }
+                // check coinbase scriptSig length (must be 2-100 bytes)
+                if tx.is_coinbase() {
+                    let len = tx.inputs[0].script_sig.len();
+                    if len < 2 {
+                        return Err(E(Inner::CoinbaseScriptSigTooSmall(len)));
+                    }
+                    if len > 100 {
+                        return Err(E(Inner::CoinbaseScriptSigTooLarge(len)));
+                    }
+                }
+                // check for duplicate inputs (CVE-2018-17144).
+                let mut outpoints: Vec<_> = tx.inputs.iter().map(|i| i.previous_output).collect();
+                outpoints.sort_unstable();
+                for pair in outpoints.windows(2) {
+                    if pair[0] == pair[1] {
+                        return Err(E(Inner::DuplicateInput(pair[0])));
+                    }
+                }
+                // Check that sum of output values doesn't exceed MAX_MONEY (see CVE-2010-5139)
+                // Note: Individual output values are already validated by Amount::from_sat()
+                // during decoding, so we only need to check the sum here.
+                let mut total_out: u64 = 0;
+                for output in &tx.outputs {
+                    total_out = total_out.saturating_add(output.amount.to_sat());
+                    if total_out > Amount::MAX_MONEY.to_sat() {
+                        return Err(E(Inner::OutputValueSumTooLarge(total_out)));
+                    }
+                }
+                Ok(tx)
+            }
+            State::Errored => panic!("call to end() after decoder errored"),
+        }
+    }
+
+    #[inline]
+    fn read_limit(&self) -> usize {
+        use TransactionDecoderState as State;
+
+        match &self.state {
+            State::Version(decoder) => decoder.read_limit(),
+            State::Inputs(_, _, decoder) => decoder.read_limit(),
+            State::SegwitFlag(_) => 1,
+            State::Outputs(_, _, _, decoder) => decoder.read_limit(),
+            State::Witnesses(_, _, _, _, decoder) => decoder.read_limit(),
+            State::LockTime(_, _, _, decoder) => decoder.read_limit(),
+            State::Done(_) => 0,
+            // `read_limit` is not documented to panic or return an error, so we
+            // return a dummy value if the decoder is in an error state.
+            State::Errored => 0,
+        }
+    }
+}
+
+/// The state of the transaction decoder.
+#[cfg(feature = "alloc")]
+#[derive(Debug, Clone)]
+enum TransactionDecoderState {
+    /// Decoding the transaction version.
+    Version(VersionDecoder),
+    /// Decoding the transaction inputs.
+    Inputs(Version, Attempt, VecDecoder<TxIn>),
+    /// Decoding the segwit flag.
+    SegwitFlag(Version),
+    /// Decoding the transaction outputs.
+    Outputs(Version, Vec<TxIn>, IsSegwit, VecDecoder<TxOut>),
+    /// Decoding the segwit transaction witnesses.
+    Witnesses(Version, Vec<TxIn>, Vec<TxOut>, Iteration, WitnessDecoder),
+    /// Decoding the transaction lock time.
+    LockTime(Version, Vec<TxIn>, Vec<TxOut>, LockTimeDecoder),
+    /// Done decoding the [`Transaction`].
+    Done(Transaction),
+    /// When `end()`ing a sub-decoder, encountered an error which prevented us
+    /// from constructing the next sub-decoder.
+    Errored,
+}
+
+/// Boolean used to track number of times we have attempted to decode the inputs vector.
+#[cfg(feature = "alloc")]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum Attempt {
+    /// First time reading inputs.
+    First,
+    /// Second time reading inputs.
+    Second,
+}
+
+/// Boolean used to track whether or not this transaction uses segwit encoding.
+#[cfg(feature = "alloc")]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum IsSegwit {
+    /// Yes so uses segwit encoding.
+    Yes,
+    /// No segwit flag, marker, or witnesses.
+    No,
+}
+
+/// How many times we have state transitioned to encoding a witness (zero-based).
+#[cfg(feature = "alloc")]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+struct Iteration(usize);
+
+/// Bitcoin transaction input.
+///
+/// It contains the location of the previous transaction's output
+/// that it spends, and the set of scripts that satisfy its spending
+/// conditions.
+///
+/// # Bitcoin Core References
+///
+/// * [CTxIn definition](https://github.com/bitcoin/bitcoin/blob/345457b542b6a980ccfbc868af0970a6f91d1b82/src/primitives/transaction.h#L65)
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
+#[cfg(feature = "alloc")]
+pub struct TxIn {
+    /// The reference to the previous output that is being used as an input.
+    pub previous_output: OutPoint,
+    /// The script which pushes values on the stack which will cause
+    /// the referenced output's script to be accepted.
+    pub script_sig: ScriptSigBuf,
+    /// The sequence number, which suggests to miners which of two
+    /// conflicting transactions should be preferred, or 0xFFFFFFFF
+    /// to ignore this feature. This is generally never used since
+    /// the miner behavior cannot be enforced.
+    pub sequence: Sequence,
+    /// Witness data: an array of byte-arrays.
+    /// Note that this field is *not* (de)serialized with the rest of the `TxIn` in
+    /// Encodable/Decodable, as it is (de)serialized at the end of the full
+    /// Transaction. It *is* (de)serialized with the rest of the `TxIn` in other
+    /// (de)serialization routines.
+    pub witness: Witness,
+}
+
+#[cfg(feature = "alloc")]
+impl TxIn {
+    /// An empty transaction input with the previous output as for a coinbase transaction.
+    ///
+    /// This has a 0-byte scriptSig which is **invalid** per consensus rules
+    /// (coinbase scriptSig must be 2-100 bytes). This is kept for backwards compatibility
+    /// in PSBT workflows where the scriptSig is filled in later.
+    pub const EMPTY_COINBASE: Self = Self {
+        previous_output: OutPoint::COINBASE_PREVOUT,
+        script_sig: ScriptSigBuf::new(),
+        sequence: Sequence::MAX,
+        witness: Witness::new(),
+    };
+}
+
+#[cfg(feature = "alloc")]
+encoding::encoder_newtype_exact! {
+    /// The encoder for the [`TxIn`] type.
+    #[derive(Debug, Clone)]
+    pub struct TxInEncoder<'e>(
+        Encoder3<OutPointEncoder<'e>, ScriptEncoder<'e>, SequenceEncoder<'e>>
+    );
+}
+
+#[cfg(feature = "alloc")]
+impl encoding::Encode for TxIn {
+    type Encoder<'e>
+        = TxInEncoder<'e>
+    where
+        Self: 'e;
+
+    fn encoder(&self) -> Self::Encoder<'_> {
+        TxInEncoder::new(Encoder3::new(
+            self.previous_output.encoder(),
+            self.script_sig.encoder(),
+            self.sequence.encoder(),
+        ))
+    }
+}
+
+/// Encodes the witnesses from a list of inputs.
+#[cfg(feature = "alloc")]
+#[derive(Debug, Clone)]
+pub struct WitnessesEncoder<'e> {
+    inputs: &'e [TxIn],
+    /// Encoder for the current witness being encoded.
+    cur_enc: Option<WitnessEncoder<'e>>,
+}
+
+#[cfg(feature = "alloc")]
+impl<'e> WitnessesEncoder<'e> {
+    /// Constructs a new encoder for all witnesses in a list of transaction inputs.
+    pub fn new(inputs: &'e [TxIn]) -> Self {
+        Self { inputs, cur_enc: inputs.first().map(|input| input.witness.encoder()) }
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl encoding::Encoder for WitnessesEncoder<'_> {
+    #[inline]
+    fn current_chunk(&self) -> &[u8] {
+        self.cur_enc.as_ref().map(WitnessEncoder::current_chunk).unwrap_or_default()
+    }
+
+    #[inline]
+    fn advance(&mut self) -> EncoderStatus {
+        let Some(cur) = self.cur_enc.as_mut() else {
+            return EncoderStatus::Finished;
+        };
+
+        loop {
+            // On subsequent calls, attempt to advance the current encoder and return
+            // success if this succeeds.
+            if cur.advance().has_more() {
+                return EncoderStatus::HasMore;
+            }
+            // self.inputs guaranteed to be non-empty if cur_enc is non-None.
+            self.inputs = &self.inputs[1..];
+
+            // If advancing the current encoder failed, attempt to move to the next encoder.
+            if let Some(input) = self.inputs.first() {
+                *cur = input.witness.encoder();
+                if !cur.current_chunk().is_empty() {
+                    return EncoderStatus::HasMore;
+                }
+            } else {
+                self.cur_enc = None; // shortcut the next call to advance()
+                return EncoderStatus::Finished;
+            }
+        }
+    }
+}
+
+#[cfg(feature = "alloc")]
+type TxInInnerDecoder = Decoder3<OutPointDecoder, ScriptSigBufDecoder, SequenceDecoder>;
+
+#[cfg(feature = "alloc")]
+crate::decoder_newtype! {
+    /// The decoder for the [`TxIn`] type.
+    #[derive(Debug, Clone)]
+    pub struct TxInDecoder(TxInInnerDecoder);
+
+    /// Constructs a new [`TxIn`] decoder.
+    pub const fn new() -> Self {
+        Self(Decoder3::new(
+            OutPointDecoder::new(),
+            ScriptSigBufDecoder::new(),
+            SequenceDecoder::new(),
+        ))
+    }
+
+    fn end(
+        result: Result<<TxInInnerDecoder as encoding::Decoder>::Output, <TxInInnerDecoder as encoding::Decoder>::Error>
+    ) -> Result<TxIn, TxInDecoderError> {
+        let (previous_output, script_sig, sequence) = result.map_err(TxInDecoderError)?;
+        Ok(TxIn { previous_output, script_sig, sequence, witness: Witness::default() })
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl encoding::Decode for TxIn {
+    type Decoder = TxInDecoder;
+}
+
+/// Bitcoin transaction output.
+///
+/// Defines new coins to be created as a result of the transaction,
+/// along with spending conditions ("script", aka "output script"),
+/// which an input spending it must satisfy.
+///
+/// An output that is not yet spent by an input is called Unspent Transaction Output ("UTXO").
+///
+/// # Bitcoin Core References
+///
+/// * [CTxOut definition](https://github.com/bitcoin/bitcoin/blob/345457b542b6a980ccfbc868af0970a6f91d1b82/src/primitives/transaction.h#L148)
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
+#[cfg(feature = "alloc")]
+pub struct TxOut {
+    /// The value of the output.
+    pub amount: Amount,
+    /// The script which must be satisfied for the output to be spent.
+    pub script_pubkey: ScriptPubKeyBuf,
+}
+
+#[cfg(feature = "alloc")]
+encoding::encoder_newtype_exact! {
+    /// The encoder for the [`TxOut`] type.
+    #[derive(Debug, Clone)]
+    pub struct TxOutEncoder<'e>(Encoder2<AmountEncoder<'e>, ScriptEncoder<'e>>);
+}
+
+#[cfg(feature = "alloc")]
+impl encoding::Encode for TxOut {
+    type Encoder<'e>
+        = TxOutEncoder<'e>
+    where
+        Self: 'e;
+
+    fn encoder(&self) -> Self::Encoder<'_> {
+        TxOutEncoder::new(Encoder2::new(self.amount.encoder(), self.script_pubkey.encoder()))
+    }
+}
+
+#[cfg(feature = "alloc")]
+type TxOutInnerDecoder = Decoder2<AmountDecoder, ScriptPubKeyBufDecoder>;
+
+#[cfg(feature = "alloc")]
+crate::decoder_newtype! {
+    /// The decoder for the [`TxOut`] type.
+    #[derive(Debug, Clone)]
+    pub struct TxOutDecoder(TxOutInnerDecoder);
+
+    /// Constructs a new [`TxOut`] decoder.
+    pub const fn new() -> Self {
+        Self(Decoder2::new(AmountDecoder::new(), ScriptPubKeyBufDecoder::new()))
+    }
+
+    fn end(
+        result: Result<<TxOutInnerDecoder as encoding::Decoder>::Output, <TxOutInnerDecoder as encoding::Decoder>::Error>
+    ) -> Result<TxOut, TxOutDecoderError> {
+        let (amount, script_pubkey) = result.map_err(TxOutDecoderError)?;
+        Ok(TxOut { amount, script_pubkey })
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl encoding::Decode for TxOut {
+    type Decoder = TxOutDecoder;
+}
+
+/// A reference to a transaction output.
+///
+/// # Bitcoin Core References
+///
+/// * [COutPoint definition](https://github.com/bitcoin/bitcoin/blob/345457b542b6a980ccfbc868af0970a6f91d1b82/src/primitives/transaction.h#L26)
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq, PartialOrd, Ord)]
+pub struct OutPoint {
+    /// The referenced transaction's txid.
+    pub txid: Txid,
+    /// The index of the referenced output in its transaction's vout.
+    pub vout: u32,
+}
+
+impl OutPoint {
+    /// The number of bytes that an outpoint contributes to the size of a transaction.
+    pub const SIZE: usize = 32 + 4; // The serialized lengths of txid and vout.
+
+    /// The `OutPoint` used in a coinbase prevout.
+    ///
+    /// This is used as the dummy input for coinbase transactions because they don't have any
+    /// previous outputs. In other words, does not point to a real transaction.
+    pub const COINBASE_PREVOUT: Self = Self { txid: Txid::COINBASE_PREVOUT, vout: u32::MAX };
+}
+
+encoding::encoder_newtype_exact! {
+    /// The encoder for the [`OutPoint`] type.
+    #[derive(Debug, Clone)]
+    pub struct OutPointEncoder<'e>(Encoder2<BytesEncoder<'e>, ArrayEncoder<4>>);
+}
+
+impl encoding::Encode for OutPoint {
+    type Encoder<'e>
+        = OutPointEncoder<'e>
+    where
+        Self: 'e;
+
+    fn encoder(&self) -> Self::Encoder<'_> {
+        OutPointEncoder::new(Encoder2::new(
+            BytesEncoder::without_length_prefix(self.txid.as_byte_array()),
+            ArrayEncoder::without_length_prefix(self.vout.to_le_bytes()),
+        ))
+    }
+}
+
+#[cfg(feature = "hex")]
+impl fmt::Display for OutPoint {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}:{}", self.txid, self.vout)
+    }
+}
+
+#[cfg(feature = "alloc")]
+#[cfg(feature = "hex")]
+impl core::str::FromStr for OutPoint {
+    type Err = ParseOutPointError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.len() > 75 {
+            // 64 + 1 + 10
+            return Err(ParseOutPointError::TooLong);
+        }
+        let find = s.find(':');
+        if find.is_none() || find != s.rfind(':') {
+            return Err(ParseOutPointError::Format);
+        }
+        let colon = find.unwrap();
+        if colon == 0 || colon == s.len() - 1 {
+            return Err(ParseOutPointError::Format);
+        }
+        Ok(Self {
+            txid: s[..colon].parse().map_err(ParseOutPointError::Txid)?,
+            vout: parse_vout(&s[colon + 1..])?,
+        })
+    }
+}
+
+/// Parses a string-encoded transaction index (vout).
+///
+/// Does not permit leading zeroes or non-digit characters.
+#[cfg(feature = "alloc")]
+#[cfg(feature = "hex")]
+fn parse_vout(s: &str) -> Result<u32, ParseOutPointError> {
+    if s.len() > 1 {
+        let first = s.chars().next().unwrap();
+        if first == '0' || first == '+' {
+            return Err(ParseOutPointError::VoutNotCanonical);
+        }
+    }
+    parse_int::int_from_str(s).map_err(ParseOutPointError::Vout)
+}
+
+crate::decoder_newtype! {
+    /// The decoder for the [`OutPoint`] type.
+    // 32 for the txid + 4 for the vout
+    #[derive(Debug, Clone)]
+    pub struct OutPointDecoder(encoding::ArrayDecoder<36>);
+
+    /// Constructs a new [`OutPoint`] decoder.
+    pub const fn new() -> Self { Self(encoding::ArrayDecoder::new()) }
+
+    fn end(result: Result<[u8; 36], encoding::UnexpectedEofError>) -> Result<OutPoint, OutPointDecoderError> {
+        let encoded = result.map_err(OutPointDecoderError)?;
+        let (txid_buf, vout_buf) = encoded.split_array::<32, 4>();
+
+        let txid = Txid::from_byte_array(*txid_buf);
+        let vout = u32::from_le_bytes(*vout_buf);
+
+        Ok(OutPoint { txid, vout })
+    }
+}
+
+impl encoding::Decode for OutPoint {
+    type Decoder = OutPointDecoder;
+}
+
+#[cfg(feature = "serde")]
+impl Serialize for OutPoint {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if serializer.is_human_readable() {
+            serializer.collect_str(&self)
+        } else {
+            use crate::serde::ser::SerializeStruct as _;
+
+            let mut state = serializer.serialize_struct("OutPoint", 2)?;
+            // serializing as an array was found in the past to break for some serializers so we use
+            // a slice instead. This causes 8 bytes to be prepended for the length (even though this
+            // is a bit silly because know the length).
+            state.serialize_field("txid", self.txid.as_byte_array().as_slice())?;
+            state.serialize_field("vout", &self.vout.to_le_bytes())?;
+            state.end()
+        }
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> Deserialize<'de> for OutPoint {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        if deserializer.is_human_readable() {
+            struct StringVisitor;
+
+            impl de::Visitor<'_> for StringVisitor {
+                type Value = OutPoint;
+
+                fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                    formatter.write_str("a string in format 'txid:vout'")
+                }
+
+                fn visit_str<E>(self, value: &str) -> Result<OutPoint, E>
+                where
+                    E: de::Error,
+                {
+                    value.parse::<OutPoint>().map_err(de::Error::custom)
+                }
+            }
+
+            deserializer.deserialize_str(StringVisitor)
+        } else {
+            #[derive(Deserialize)]
+            #[serde(field_identifier, rename_all = "lowercase")]
+            enum Field {
+                Txid,
+                Vout,
+            }
+
+            struct OutPointVisitor;
+
+            impl<'de> de::Visitor<'de> for OutPointVisitor {
+                type Value = OutPoint;
+
+                fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                    formatter.write_str("OutPoint struct with fields")
+                }
+
+                fn visit_seq<V>(self, mut seq: V) -> Result<OutPoint, V::Error>
+                where
+                    V: de::SeqAccess<'de>,
+                {
+                    let txid =
+                        seq.next_element()?.ok_or_else(|| de::Error::invalid_length(0, &self))?;
+                    let vout =
+                        seq.next_element()?.ok_or_else(|| de::Error::invalid_length(1, &self))?;
+                    Ok(OutPoint { txid, vout })
+                }
+
+                fn visit_map<V>(self, mut map: V) -> Result<OutPoint, V::Error>
+                where
+                    V: de::MapAccess<'de>,
+                {
+                    let mut txid = None;
+                    let mut vout = None;
+
+                    while let Some(key) = map.next_key()? {
+                        match key {
+                            Field::Txid => {
+                                if txid.is_some() {
+                                    return Err(de::Error::duplicate_field("txid"));
+                                }
+                                let bytes: [u8; 32] = map.next_value()?;
+                                txid = Some(Txid::from_byte_array(bytes));
+                            }
+                            Field::Vout => {
+                                if vout.is_some() {
+                                    return Err(de::Error::duplicate_field("vout"));
+                                }
+                                let bytes: [u8; 4] = map.next_value()?;
+                                vout = Some(u32::from_le_bytes(bytes));
+                            }
+                        }
+                    }
+
+                    let txid = txid.ok_or_else(|| de::Error::missing_field("txid"))?;
+                    let vout = vout.ok_or_else(|| de::Error::missing_field("vout"))?;
+
+                    Ok(OutPoint { txid, vout })
+                }
+            }
+
+            const FIELDS: &[&str] = &["txid", "vout"];
+            deserializer.deserialize_struct("OutPoint", FIELDS, OutPointVisitor)
+        }
+    }
+}
+
+/// The transaction version.
+///
+/// Currently, as specified by [BIP-0068] and [BIP-0431], version 1, 2, and 3 are considered standard.
+///
+/// Standardness of the inner `u32` is not an invariant because you are free to create transactions
+/// of any version, transactions with non-standard version numbers will not be relayed by the
+/// Bitcoin network.
+///
+/// [BIP-0068]: https://github.com/bitcoin/bips/blob/master/bip-0068.mediawiki
+/// [BIP-0431]: https://github.com/bitcoin/bips/blob/master/bip-0431.mediawiki
+#[derive(Copy, PartialEq, Eq, Clone, Debug, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct Version(u32);
+
+impl Version {
+    /// The original Bitcoin transaction version (pre-BIP-0068).
+    pub const ONE: Self = Self(1);
+
+    /// The second Bitcoin transaction version (post-BIP-0068).
+    pub const TWO: Self = Self(2);
+
+    /// The third Bitcoin transaction version (post-BIP-0431).
+    pub const THREE: Self = Self(3);
+
+    /// Constructs a potentially non-standard transaction version.
+    ///
+    /// This can accept both standard and non-standard versions.
+    #[inline]
+    pub const fn maybe_non_standard(version: u32) -> Self { Self(version) }
+
+    /// Returns the inner `u32` value of this `Version`.
+    #[inline]
+    pub const fn to_u32(self) -> u32 { self.0 }
+
+    /// Returns true if this transaction version number is considered standard.
+    ///
+    /// The behavior of this method matches whatever Bitcoin Core considers standard at the time
+    /// of the release and may change in future versions to accommodate new standard versions.
+    /// As of Bitcoin Core 28.0 ([release notes](https://bitcoincore.org/en/releases/28.0/)),
+    /// versions 1, 2, and 3 are considered standard.
+    #[inline]
+    pub const fn is_standard(self) -> bool {
+        self.0 == Self::ONE.0 || self.0 == Self::TWO.0 || self.0 == Self::THREE.0
+    }
+}
+
+impl fmt::Display for Version {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { fmt::Display::fmt(&self.0, f) }
+}
+
+impl fmt::LowerHex for Version {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::LowerHex::fmt(&self.0, f) }
+}
+
+impl fmt::UpperHex for Version {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::UpperHex::fmt(&self.0, f) }
+}
+
+impl fmt::Octal for Version {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::Octal::fmt(&self.0, f) }
+}
+
+impl fmt::Binary for Version {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::Binary::fmt(&self.0, f) }
+}
+
+impl From<Version> for u32 {
+    #[inline]
+    fn from(version: Version) -> Self { version.0 }
+}
+
+encoding::encoder_newtype_exact! {
+    /// The encoder for the [`Version`] type.
+    #[derive(Debug, Clone)]
+    pub struct VersionEncoder<'e>(encoding::ArrayEncoder<4>);
+}
+
+impl encoding::Encode for Version {
+    type Encoder<'e> = VersionEncoder<'e>;
+    fn encoder(&self) -> Self::Encoder<'_> {
+        VersionEncoder::new(encoding::ArrayEncoder::without_length_prefix(
+            self.to_u32().to_le_bytes(),
+        ))
+    }
+}
+
+crate::decoder_newtype! {
+    /// The decoder for the [`Version`] type.
+    #[derive(Debug, Clone)]
+    pub struct VersionDecoder(encoding::ArrayDecoder<4>);
+
+    /// Constructs a new [`Version`] decoder.
+    pub const fn new() -> Self { Self(encoding::ArrayDecoder::new()) }
+
+    fn end(result: Result<[u8; 4], encoding::UnexpectedEofError>) -> Result<Version, VersionDecoderError> {
+        let bytes = result.map_err(VersionDecoderError)?;
+        let n = u32::from_le_bytes(bytes);
+        Ok(Version::maybe_non_standard(n))
+    }
+}
+
+impl encoding::Decode for Version {
+    type Decoder = VersionDecoder;
+}
+
+/// Error types for Bitcoin transactions.
+pub mod error {
+    use core::convert::Infallible;
+    use core::fmt;
+
+    use internals::write_err;
+
+    #[cfg(feature = "hex")]
+    #[cfg(feature = "alloc")]
+    use super::parse_int;
+    #[cfg(feature = "alloc")]
+    use super::OutPoint;
+    #[cfg(feature = "alloc")]
+    use crate::locktime::absolute::LockTimeDecoderError;
+    #[cfg(feature = "alloc")]
+    use crate::witness::WitnessDecoderError;
+
+    /// An error consensus decoding a `Transaction`.
+    #[cfg(feature = "alloc")]
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct TransactionDecoderError(pub(super) TransactionDecoderErrorInner);
+
+    #[cfg(feature = "alloc")]
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(super) enum TransactionDecoderErrorInner {
+        /// Error while decoding the `version`.
+        Version(VersionDecoderError),
+        /// We only support segwit flag value 0x01.
+        UnsupportedSegwitFlag(u8),
+        /// Error while decoding the `inputs`.
+        Inputs(encoding::VecDecoderError<TxInDecoderError>),
+        /// Error while decoding the `outputs`.
+        Outputs(encoding::VecDecoderError<TxOutDecoderError>),
+        /// Error while decoding one of the witnesses.
+        Witness(WitnessDecoderError),
+        /// Non-empty Segwit transaction with no witnesses.
+        NoWitnesses,
+        /// Error while decoding the `lock_time`.
+        LockTime(LockTimeDecoderError),
+        /// Attempt to call `end()` before the transaction was complete. Holds
+        /// a description of the current state.
+        EarlyEnd(&'static str),
+        /// Null prevout in non-coinbase transaction.
+        NullPrevoutInNonCoinbase(usize),
+        /// Coinbase scriptSig too small (must be at least 2 bytes).
+        CoinbaseScriptSigTooSmall(usize),
+        /// Coinbase scriptSig is too large (must be at most 100 bytes).
+        CoinbaseScriptSigTooLarge(usize),
+        /// Transaction has duplicate inputs (this check prevents CVE-2018-17144 ).
+        DuplicateInput(OutPoint),
+        /// Sum of output values exceeds `MAX_MONEY`
+        OutputValueSumTooLarge(u64),
+        /// Transaction has no outputs.
+        NoOutputs,
+    }
+
+    #[cfg(feature = "alloc")]
+    impl From<Infallible> for TransactionDecoderError {
+        fn from(never: Infallible) -> Self { match never {} }
+    }
+
+    #[cfg(feature = "alloc")]
+    impl fmt::Display for TransactionDecoderError {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            use TransactionDecoderErrorInner as E;
+
+            match self.0 {
+                E::Version(ref e) => write_err!(f, "transaction decoder error"; e),
+                E::UnsupportedSegwitFlag(v) => {
+                    write!(f, "we only support segwit flag value 0x01: {}", v)
+                }
+                E::Inputs(ref e) => write_err!(f, "transaction decoder error"; e),
+                E::Outputs(ref e) => write_err!(f, "transaction decoder error"; e),
+                E::Witness(ref e) => write_err!(f, "transaction decoder error"; e),
+                E::NoWitnesses => write!(f, "non-empty Segwit transaction with no witnesses"),
+                E::LockTime(ref e) => write_err!(f, "transaction decoder error"; e),
+                E::EarlyEnd(s) => write!(f, "early end of transaction (still decoding {})", s),
+                E::NullPrevoutInNonCoinbase(index) =>
+                    write!(f, "null prevout in non-coinbase transaction at input {}", index),
+                E::CoinbaseScriptSigTooSmall(len) =>
+                    write!(f, "coinbase scriptSig too small: {} bytes (min 2)", len),
+                E::CoinbaseScriptSigTooLarge(len) =>
+                    write!(f, "coinbase scriptSig too large: {} bytes (max 100)", len),
+                E::DuplicateInput(ref outpoint) =>
+                    write!(f, "duplicate input: {:?}:{}", outpoint.txid, outpoint.vout),
+                E::OutputValueSumTooLarge(val) =>
+                    write!(f, "sum of output values {} satoshis exceeds MAX_MONEY", val),
+                E::NoOutputs => write!(f, "transaction has no outputs"),
+            }
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[cfg(feature = "alloc")]
+    impl std::error::Error for TransactionDecoderError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            use TransactionDecoderErrorInner as E;
+
+            match self.0 {
+                E::Version(ref e) => Some(e),
+                E::UnsupportedSegwitFlag(_) => None,
+                E::Inputs(ref e) => Some(e),
+                E::Outputs(ref e) => Some(e),
+                E::Witness(ref e) => Some(e),
+                E::NoWitnesses => None,
+                E::LockTime(ref e) => Some(e),
+                E::EarlyEnd(_) => None,
+                E::NullPrevoutInNonCoinbase(_) => None,
+                E::CoinbaseScriptSigTooSmall(_) => None,
+                E::CoinbaseScriptSigTooLarge(_) => None,
+                E::DuplicateInput(_) => None,
+                E::OutputValueSumTooLarge(_) => None,
+                E::NoOutputs => None,
+            }
+        }
+    }
+
+    /// An error consensus decoding a `TxIn`.
+    #[cfg(feature = "alloc")]
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct TxInDecoderError(pub(super) <super::TxInInnerDecoder as encoding::Decoder>::Error);
+
+    #[cfg(feature = "alloc")]
+    impl From<Infallible> for TxInDecoderError {
+        fn from(never: Infallible) -> Self { match never {} }
+    }
+
+    #[cfg(feature = "alloc")]
+    impl fmt::Display for TxInDecoderError {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write_err!(f, "txin decoder error"; self.0)
+        }
+    }
+
+    #[cfg(feature = "alloc")]
+    #[cfg(feature = "std")]
+    impl std::error::Error for TxInDecoderError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
+    }
+
+    /// An error consensus decoding a `TxOut`.
+    #[cfg(feature = "alloc")]
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct TxOutDecoderError(pub(super) <super::TxOutInnerDecoder as encoding::Decoder>::Error);
+
+    #[cfg(feature = "alloc")]
+    impl From<Infallible> for TxOutDecoderError {
+        fn from(never: Infallible) -> Self { match never {} }
+    }
+
+    #[cfg(feature = "alloc")]
+    impl fmt::Display for TxOutDecoderError {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write_err!(f, "txout decoder error"; self.0)
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for TxOutDecoderError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
+    }
+
+    /// Error while decoding an `OutPoint`.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct OutPointDecoderError(pub(super) encoding::UnexpectedEofError);
+
+    impl From<Infallible> for OutPointDecoderError {
+        fn from(never: Infallible) -> Self { match never {} }
+    }
+
+    impl core::fmt::Display for OutPointDecoderError {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            write_err!(f, "out point decoder error"; self.0)
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for OutPointDecoderError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
+    }
+
+    /// An error in parsing an [`OutPoint`].
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[non_exhaustive]
+    #[cfg(feature = "alloc")]
+    #[cfg(feature = "hex")]
+    pub enum ParseOutPointError {
+        /// Error in TXID part.
+        Txid(hex::DecodeFixedLengthBytesError),
+        /// Error in vout part.
+        Vout(parse_int::ParseIntError),
+        /// Error in general format.
+        Format,
+        /// Size exceeds max.
+        TooLong,
+        /// Vout part is not strictly numeric without leading zeroes.
+        VoutNotCanonical,
+    }
+
+    #[cfg(feature = "alloc")]
+    #[cfg(feature = "hex")]
+    impl From<Infallible> for ParseOutPointError {
+        #[inline]
+        fn from(never: Infallible) -> Self { match never {} }
+    }
+
+    #[cfg(feature = "alloc")]
+    #[cfg(feature = "hex")]
+    impl fmt::Display for ParseOutPointError {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            match *self {
+                Self::Txid(ref e) => write_err!(f, "error parsing TXID"; e),
+                Self::Vout(ref e) => write_err!(f, "error parsing vout"; e),
+                Self::Format => write!(f, "OutPoint not in <txid>:<vout> format"),
+                Self::TooLong => write!(f, "vout should be at most 10 digits"),
+                Self::VoutNotCanonical => write!(f, "no leading zeroes or + allowed in vout part"),
+            }
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[cfg(feature = "hex")]
+    impl std::error::Error for ParseOutPointError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            match self {
+                Self::Txid(e) => Some(e),
+                Self::Vout(e) => Some(e),
+                Self::Format | Self::TooLong | Self::VoutNotCanonical => None,
+            }
+        }
+    }
+
+    /// An error consensus decoding a `Version`.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct VersionDecoderError(pub(super) encoding::UnexpectedEofError);
+
+    impl From<Infallible> for VersionDecoderError {
+        fn from(never: Infallible) -> Self { match never {} }
+    }
+
+    impl fmt::Display for VersionDecoderError {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write_err!(f, "version decoder error"; self.0)
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for VersionDecoderError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
+    }
+}
+
+#[cfg(feature = "arbitrary")]
+#[cfg(feature = "alloc")]
+impl<'a> Arbitrary<'a> for Transaction {
+    fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
+        let version = Version::arbitrary(u)?;
+        let lock_time = absolute::LockTime::arbitrary(u)?;
+        let mut inputs = Vec::<TxIn>::arbitrary(u)?;
+        let mut outputs = Vec::<TxOut>::arbitrary(u)?;
+
+        let mut seen = alloc::collections::BTreeSet::new();
+        inputs.retain(|input| seen.insert(input.previous_output));
+
+        if inputs.len() > 1 {
+            inputs.retain(|input| input.previous_output != OutPoint::COINBASE_PREVOUT);
+        }
+
+        if inputs.len() == 1 && inputs[0].previous_output == OutPoint::COINBASE_PREVOUT {
+            let len = inputs[0].script_sig.len();
+            if len < 2 || len > 100 {
+                inputs[0].script_sig = ScriptSigBuf::from_bytes(Vec::from([0u8; 2]));
+            }
+        }
+
+        if outputs.is_empty() {
+            outputs.push(TxOut::arbitrary(u)?);
+        }
+
+        let mut remaining = Amount::MAX_MONEY.to_sat();
+        for output in &mut outputs {
+            let capped = output.amount.to_sat().min(remaining);
+            output.amount = Amount::from_sat(capped).expect("capped <= MAX_MONEY");
+            remaining -= capped;
+        }
+
+        Ok(Self { version, lock_time, inputs, outputs })
+    }
+}
+
+#[cfg(feature = "arbitrary")]
+#[cfg(feature = "alloc")]
+impl<'a> Arbitrary<'a> for TxIn {
+    fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
+        Ok(Self {
+            previous_output: OutPoint::arbitrary(u)?,
+            script_sig: ScriptSigBuf::arbitrary(u)?,
+            sequence: Sequence::arbitrary(u)?,
+            witness: Witness::arbitrary(u)?,
+        })
+    }
+}
+
+#[cfg(feature = "arbitrary")]
+#[cfg(feature = "alloc")]
+impl<'a> Arbitrary<'a> for TxOut {
+    fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
+        Ok(Self { amount: Amount::arbitrary(u)?, script_pubkey: ScriptPubKeyBuf::arbitrary(u)? })
+    }
+}
+
+#[cfg(feature = "arbitrary")]
+impl<'a> Arbitrary<'a> for OutPoint {
+    fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
+        Ok(Self { txid: Txid::arbitrary(u)?, vout: u32::arbitrary(u)? })
+    }
+}
+
+#[cfg(feature = "arbitrary")]
+impl<'a> Arbitrary<'a> for Version {
+    fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
+        // Equally weight the case of normal version numbers
+        let choice = u.int_in_range(0..=3)?;
+        match choice {
+            0 => Ok(Self::ONE),
+            1 => Ok(Self::TWO),
+            2 => Ok(Self::THREE),
+            _ => Ok(Self(u.arbitrary()?)),
+        }
+    }
+}
+
+#[cfg(feature = "alloc")]
+#[cfg(test)]
+mod tests {
+    use alloc::string::ToString;
+    use alloc::{format, vec};
+    #[cfg(feature = "hex")]
+    use core::str::FromStr as _;
+    #[cfg(feature = "std")]
+    use std::error::Error as _;
+
+    use encoding::{Decode as _, Decoder as _};
+    #[cfg(feature = "hex")]
+    use hex::hex;
+
+    use super::*;
+
+    const TC_TXID_BYTES: [u8; 32] = [
+        32, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10,
+        9, 8, 7, 6, 5, 4, 3, 2, 1,
+    ];
+    const TC_VOUT_BYTES: [u8; 4] = [1, 0, 0, 0];
+    const TC_SCRIPT_BYTES: [u8; 3] = [1, 2, 3];
+    const TC_ONE_SAT_BYTES: [u8; 8] = [1, 0, 0, 0, 0, 0, 0, 0];
+
+    #[test]
+    fn sanity_check() {
+        let version = Version(123);
+        assert_eq!(version.to_u32(), 123);
+        assert_eq!(u32::from(version), 123);
+
+        assert!(!version.is_standard());
+        assert!(Version::ONE.is_standard());
+        assert!(Version::TWO.is_standard());
+        assert!(Version::THREE.is_standard());
+    }
+
+    #[test]
+    fn transaction_functions() {
+        let txin = TxIn {
+            previous_output: OutPoint {
+                txid: Txid::from_byte_array([0xAA; 32]), // Arbitrary invalid dummy value.
+                vout: 0,
+            },
+            script_sig: ScriptSigBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        };
+
+        let txout = TxOut {
+            amount: Amount::from_sat(123_456_789).unwrap(),
+            script_pubkey: ScriptPubKeyBuf::new(),
+        };
+
+        let tx_orig = Transaction {
+            version: Version::ONE,
+            lock_time: absolute::LockTime::from_consensus(1_738_968_231), // The time this was written
+            inputs: vec![txin],
+            outputs: vec![txout],
+        };
+
+        // Test changing the transaction
+        let mut tx = tx_orig.clone();
+        tx.inputs[0].previous_output.txid = Txid::from_byte_array([0xFF; 32]);
+        tx.outputs[0].amount = Amount::from_sat(987_654_321).unwrap();
+        assert_eq!(tx.inputs[0].previous_output.txid.to_byte_array(), [0xFF; 32]);
+        assert_eq!(tx.outputs[0].amount.to_sat(), 987_654_321);
+
+        // Test uses_segwit_serialization
+        assert!(!tx.uses_segwit_serialization());
+        tx.inputs[0].witness.push(vec![0xAB, 0xCD, 0xEF]);
+        assert!(tx.uses_segwit_serialization());
+
+        // Test partial ord
+        assert!(tx > tx_orig);
+    }
+
+    #[test]
+    #[cfg(feature = "hex")]
+    fn transaction_hex_display() {
+        let txin = TxIn {
+            previous_output: OutPoint {
+                txid: Txid::from_byte_array([0xAA; 32]), // Arbitrary invalid dummy value.
+                vout: 0,
+            },
+            script_sig: ScriptSigBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        };
+
+        let txout = TxOut {
+            amount: Amount::from_sat(123_456_789).unwrap(),
+            script_pubkey: ScriptPubKeyBuf::new(),
+        };
+
+        let tx_orig = Transaction {
+            version: Version::ONE,
+            lock_time: absolute::LockTime::from_consensus(1_765_112_030), // The time this was written
+            inputs: vec![txin],
+            outputs: vec![txout],
+        };
+
+        let encoded_tx = "0100000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0115cd5b070000000000de783569";
+        let lower_hex_tx = format!("{:x}", tx_orig);
+        let upper_hex_tx = format!("{:X}", tx_orig);
+
+        // All of these should yield a lowercase hex
+        assert_eq!(encoded_tx, lower_hex_tx);
+        assert_eq!(encoded_tx, format!("{}", tx_orig));
+        assert_eq!(format!("0x{encoded_tx}"), format!("{:#x}", tx_orig));
+        assert_eq!(format!("{:>132}", encoded_tx), format!("{:>132x}", tx_orig));
+        assert_eq!(format!("{:<132}", encoded_tx), format!("{:<132x}", tx_orig));
+        assert_eq!(format!("{:^132}", encoded_tx), format!("{:^132x}", tx_orig));
+        assert_eq!(format!("{:.20}", encoded_tx), format!("{:.20x}", tx_orig));
+
+        // And this should yield uppercase hex
+        let upper_encoded = encoded_tx
+            .chars()
+            .map(|chr| chr.to_ascii_uppercase())
+            .collect::<alloc::string::String>();
+        assert_eq!(upper_encoded, upper_hex_tx);
+        assert_eq!(format!("0X{upper_encoded}"), format!("{:#X}", tx_orig));
+    }
+
+    #[test]
+    #[cfg(feature = "hex")]
+    fn transaction_from_hex_str_round_trip() {
+        // Create two different inputs to avoid duplicate input rejection
+        let tx_in_1 = segwit_tx_in();
+        let mut tx_in_2 = segwit_tx_in();
+        tx_in_2.previous_output.vout = 2;
+
+        // Create a transaction and convert it to a hex string
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            inputs: vec![tx_in_1, tx_in_2],
+            outputs: vec![tx_out(), tx_out()],
+        };
+
+        let lower_hex_tx = format!("{:x}", tx);
+        let upper_hex_tx = format!("{:X}", tx);
+
+        // Parse the hex strings back into transactions
+        let parsed_lower = Transaction::from_str(&lower_hex_tx).unwrap();
+        let parsed_upper = Transaction::from_str(&upper_hex_tx).unwrap();
+
+        // The parsed transaction should match the originals
+        assert_eq!(tx, parsed_lower);
+        assert_eq!(tx, parsed_upper);
+    }
+
+    #[test]
+    #[cfg(feature = "hex")]
+    #[cfg(feature = "std")]
+    fn transaction_from_hex_str_error() {
+        // OddLength error
+        let odd = "abc"; // 3 chars, odd length
+        let err = Transaction::from_str(odd).unwrap_err();
+        assert!(matches!(
+            err.source().unwrap().downcast_ref::<hex::OddLengthStringError>().unwrap(),
+            hex::OddLengthStringError { .. },
+        ));
+
+        // InvalidChar error
+        let invalid = "zz";
+        let err = Transaction::from_str(invalid).unwrap_err();
+        assert!(matches!(
+            err.source().unwrap().downcast_ref::<hex::InvalidCharError>().unwrap(),
+            hex::InvalidCharError { .. },
+        ));
+
+        // Decode error
+        let bad = "deadbeef00"; // arbitrary even-length hex that will fail decoding
+        let err = Transaction::from_str(bad).unwrap_err();
+        assert!(matches!(
+            err.source()
+                .unwrap()
+                .source()
+                .unwrap()
+                .downcast_ref::<TransactionDecoderError>()
+                .unwrap(),
+            TransactionDecoderError { .. },
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "hex")]
+    fn outpoint_from_str() {
+        // Check format errors
+        let mut outpoint_str = "0".repeat(64); // No ":"
+        let outpoint: Result<OutPoint, ParseOutPointError> = outpoint_str.parse();
+        assert_eq!(outpoint, Err(ParseOutPointError::Format));
+
+        outpoint_str.push(':'); // Empty vout
+        let outpoint: Result<OutPoint, ParseOutPointError> = outpoint_str.parse();
+        assert_eq!(outpoint, Err(ParseOutPointError::Format));
+
+        outpoint_str.push('0'); // Correct format
+        let outpoint: OutPoint = outpoint_str.parse().unwrap();
+        assert_eq!(outpoint.txid, Txid::from_byte_array([0; 32]));
+        assert_eq!(outpoint.vout, 0);
+
+        // Check the number of bytes OutPoint contributes to the transaction is equal to SIZE
+        let outpoint_size = outpoint.txid.as_byte_array().len() + outpoint.vout.to_le_bytes().len();
+        assert_eq!(outpoint_size, OutPoint::SIZE);
+    }
+
+    #[test]
+    #[cfg(feature = "hex")]
+    fn outpoint_from_str_too_long() {
+        // Check edge case: length exactly 75
+        let mut outpoint_str = "0".repeat(64);
+        outpoint_str.push_str(":1234567890");
+        assert_eq!(outpoint_str.len(), 75);
+        assert!(outpoint_str.parse::<OutPoint>().is_ok());
+
+        // Check TooLong error (length 76)
+        outpoint_str.push('0');
+        assert_eq!(outpoint_str.len(), 76);
+        let outpoint: Result<OutPoint, ParseOutPointError> = outpoint_str.parse();
+        assert_eq!(outpoint, Err(ParseOutPointError::TooLong));
+    }
+
+    #[test]
+    #[cfg(feature = "hex")]
+    #[cfg(feature = "alloc")]
+    fn outpoint() {
+        assert_eq!("i don't care".parse::<OutPoint>(), Err(ParseOutPointError::Format));
+        assert_eq!(
+            "5df6e0e2761359d30a8275058e299fcc0381534545f55cf43e41983f5d4c9456:1:1"
+                .parse::<OutPoint>(),
+            Err(ParseOutPointError::Format)
+        );
+        assert_eq!(
+            "5df6e0e2761359d30a8275058e299fcc0381534545f55cf43e41983f5d4c9456:".parse::<OutPoint>(),
+            Err(ParseOutPointError::Format)
+        );
+        assert_eq!(
+            "5df6e0e2761359d30a8275058e299fcc0381534545f55cf43e41983f5d4c9456:11111111111"
+                .parse::<OutPoint>(),
+            Err(ParseOutPointError::TooLong)
+        );
+        assert_eq!(
+            "5df6e0e2761359d30a8275058e299fcc0381534545f55cf43e41983f5d4c9456:01"
+                .parse::<OutPoint>(),
+            Err(ParseOutPointError::VoutNotCanonical)
+        );
+        assert_eq!(
+            "5df6e0e2761359d30a8275058e299fcc0381534545f55cf43e41983f5d4c9456:+42"
+                .parse::<OutPoint>(),
+            Err(ParseOutPointError::VoutNotCanonical)
+        );
+        assert_eq!(
+            "i don't care:1".parse::<OutPoint>(),
+            Err(ParseOutPointError::Txid("i don't care".parse::<Txid>().unwrap_err()))
+        );
+        assert_eq!(
+            "5df6e0e2761359d30a8275058e299fcc0381534545f55cf43e41983f5d4c945X:1"
+                .parse::<OutPoint>(),
+            Err(ParseOutPointError::Txid(
+                "5df6e0e2761359d30a8275058e299fcc0381534545f55cf43e41983f5d4c945X"
+                    .parse::<Txid>()
+                    .unwrap_err()
+            ))
+        );
+        assert_eq!(
+            "5df6e0e2761359d30a8275058e299fcc0381534545f55cf43e41983f5d4c9456:lol"
+                .parse::<OutPoint>(),
+            Err(ParseOutPointError::Vout(parse_int::int_from_str::<u32>("lol").unwrap_err()))
+        );
+
+        assert_eq!(
+            "5df6e0e2761359d30a8275058e299fcc0381534545f55cf43e41983f5d4c9456:42"
+                .parse::<OutPoint>(),
+            Ok(OutPoint {
+                txid: "5df6e0e2761359d30a8275058e299fcc0381534545f55cf43e41983f5d4c9456"
+                    .parse()
+                    .unwrap(),
+                vout: 42,
+            })
+        );
+        assert_eq!(
+            "5df6e0e2761359d30a8275058e299fcc0381534545f55cf43e41983f5d4c9456:0"
+                .parse::<OutPoint>(),
+            Ok(OutPoint {
+                txid: "5df6e0e2761359d30a8275058e299fcc0381534545f55cf43e41983f5d4c9456"
+                    .parse()
+                    .unwrap(),
+                vout: 0,
+            })
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "hex")]
+    fn canonical_vout() {
+        assert_eq!(parse_vout("0").unwrap(), 0);
+        assert_eq!(parse_vout("1").unwrap(), 1);
+        assert!(parse_vout("01").is_err()); // Leading zero not allowed
+        assert!(parse_vout("+1").is_err()); // Non digits not allowed
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    #[cfg(feature = "hex")]
+    fn outpoint_display_roundtrip() {
+        let outpoint_str = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20:1";
+        let outpoint: OutPoint = outpoint_str.parse().unwrap();
+        assert_eq!(format!("{}", outpoint), outpoint_str);
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    #[cfg(feature = "hex")]
+    fn outpoint_format() {
+        let outpoint = OutPoint::COINBASE_PREVOUT;
+
+        let debug = "OutPoint { txid: Txid(bitcoin_hashes::sha256d::Hash(0000000000000000000000000000000000000000000000000000000000000000)), vout: 4294967295 }";
+        assert_eq!(debug, format!("{:?}", outpoint));
+
+        let display = "0000000000000000000000000000000000000000000000000000000000000000:4294967295";
+        assert_eq!(display, format!("{}", outpoint));
+
+        let pretty_debug = "OutPoint {
+    txid: Txid(
+        bitcoin_hashes::sha256d::Hash(
+            0x0000000000000000000000000000000000000000000000000000000000000000,
+        ),
+    ),
+    vout: 4294967295,
+}";
+        assert_eq!(pretty_debug, format!("{:#?}", outpoint));
+
+        let debug_txid = "Txid(bitcoin_hashes::sha256d::Hash(0000000000000000000000000000000000000000000000000000000000000000))";
+        assert_eq!(debug_txid, format!("{:?}", outpoint.txid));
+
+        let display_txid = "0000000000000000000000000000000000000000000000000000000000000000";
+        assert_eq!(display_txid, format!("{}", outpoint.txid));
+
+        let pretty_txid = "0x0000000000000000000000000000000000000000000000000000000000000000";
+        assert_eq!(pretty_txid, format!("{:#}", outpoint.txid));
+    }
+
+    #[test]
+    fn version_display() {
+        let version = Version(123);
+        assert_eq!(format!("{}", version), "123");
+        assert_eq!(format!("{:x}", version), "7b");
+        assert_eq!(format!("{:#x}", version), "0x7b");
+        assert_eq!(format!("{:X}", version), "7B");
+        assert_eq!(format!("{:#X}", version), "0x7B");
+        assert_eq!(format!("{:o}", version), "173");
+        assert_eq!(format!("{:#o}", version), "0o173");
+        assert_eq!(format!("{:b}", version), "1111011");
+        assert_eq!(format!("{:#b}", version), "0b1111011");
+    }
+
+    // Creates an arbitrary dummy outpoint.
+    #[cfg(any(feature = "hex", feature = "serde"))]
+    fn tc_out_point() -> OutPoint {
+        let s = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20:1";
+        s.parse::<OutPoint>().unwrap()
+    }
+
+    #[test]
+    #[cfg(feature = "serde")]
+    fn out_point_serde_deserialize_human_readable() {
+        // `sered` serialization is the same as `Display` but includes quotes.
+        let ser = "\"0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20:1\"";
+        let got = serde_json::from_str::<OutPoint>(ser).unwrap();
+        let want = tc_out_point();
+
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    #[cfg(feature = "serde")]
+    fn out_point_serde_deserialize_non_human_readable() {
+        #[rustfmt::skip]
+        let bytes = [
+            // Length, prepended by the `serde` infrastructure because we use
+            // slice serialization instead of array even though we know the length.
+            32, 0, 0, 0, 0, 0, 0, 0,
+            // The txid bytes
+            32, 31, 30, 29, 28, 27, 26, 25,
+            24, 23, 22, 21, 20, 19, 18, 17,
+            16, 15, 14, 13, 12, 11, 10, 9,
+            8, 7, 6, 5, 4, 3, 2, 1,
+            // The vout
+            1, 0, 0, 0
+        ];
+
+        let got = bincode::deserialize::<OutPoint>(&bytes).unwrap();
+        let want = tc_out_point();
+
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    #[cfg(feature = "serde")]
+    fn out_point_serde_human_readable_rountrips() {
+        let out_point = tc_out_point();
+
+        let ser = serde_json::to_string(&out_point).unwrap();
+        let got = serde_json::from_str::<OutPoint>(&ser).unwrap();
+
+        assert_eq!(got, out_point);
+    }
+
+    #[test]
+    #[cfg(feature = "serde")]
+    fn out_point_serde_non_human_readable_rountrips() {
+        let out_point = tc_out_point();
+
+        let ser = bincode::serialize(&out_point).unwrap();
+        let got = bincode::deserialize::<OutPoint>(&ser).unwrap();
+
+        assert_eq!(got, out_point);
+    }
+
+    #[cfg(feature = "alloc")]
+    fn tx_out() -> TxOut { TxOut { amount: Amount::ONE_SAT, script_pubkey: tc_script_pubkey() } }
+
+    #[cfg(any(feature = "hex", feature = "serde"))]
+    fn segwit_tx_in() -> TxIn {
+        let data = [&TC_SCRIPT_BYTES[..]];
+        let witness = Witness::from_iter(data);
+
+        TxIn {
+            previous_output: tc_out_point(),
+            script_sig: tc_script_sig(),
+            sequence: Sequence::MAX,
+            witness,
+        }
+    }
+
+    #[cfg(feature = "alloc")]
+    fn tc_script_pubkey() -> ScriptPubKeyBuf {
+        ScriptPubKeyBuf::from_bytes(TC_SCRIPT_BYTES.to_vec())
+    }
+
+    #[cfg(any(feature = "hex", feature = "serde"))]
+    fn tc_script_sig() -> ScriptSigBuf { ScriptSigBuf::from_bytes(TC_SCRIPT_BYTES.to_vec()) }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    #[cfg(feature = "hex")]
+    fn reject_null_prevout_in_non_coinbase_transaction() {
+        // Test vector taken from Bitcoin Core tx_invalid.json
+        // https://github.com/bitcoin/bitcoin/blob/master/src/test/data/tx_invalid.json#L64
+        // "Null txin, but without being a coinbase (because there are two inputs)"
+        let tx_bytes = hex!("01000000020000000000000000000000000000000000000000000000000000000000000000ffffffff00ffffffff00010000000000000000000000000000000000000000000000000000000000000000000000ffffffff010000000000000000015100000000");
+
+        let mut decoder = Transaction::decoder();
+        let mut slice = tx_bytes.as_slice();
+        decoder.push_bytes(&mut slice).unwrap();
+        let err = decoder.end().expect_err("null prevout in non-coinbase tx should be rejected");
+
+        assert_eq!(
+            err,
+            TransactionDecoderError(TransactionDecoderErrorInner::NullPrevoutInNonCoinbase(0))
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    #[cfg(feature = "hex")]
+    fn reject_coinbase_scriptsig_too_small() {
+        // Test vector taken from Bitcoin Core tx_invalid.json
+        // https://github.com/bitcoin/bitcoin/blob/master/src/test/data/tx_invalid.json#L57
+        // "Coinbase of size 1"
+        let tx_bytes = hex!("01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff0151ffffffff010000000000000000015100000000");
+
+        let mut decoder = Transaction::decoder();
+        let mut slice = tx_bytes.as_slice();
+        decoder.push_bytes(&mut slice).unwrap();
+        let err = decoder.end().expect_err("coinbase with 1-byte scriptSig should be rejected");
+
+        assert_eq!(
+            err,
+            TransactionDecoderError(TransactionDecoderErrorInner::CoinbaseScriptSigTooSmall(1))
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    #[cfg(feature = "hex")]
+    fn reject_coinbase_scriptsig_too_large() {
+        // Test vector taken from Bitcoin Core tx_invalid.json:
+        // https://github.com/bitcoin/bitcoin/blob/master/src/test/data/tx_invalid.json#L62
+        // "Coinbase of size 101"
+        let tx_bytes = hex!("01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff655151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151ffffffff010000000000000000015100000000");
+
+        let mut decoder = Transaction::decoder();
+        let mut slice = tx_bytes.as_slice();
+        decoder.push_bytes(&mut slice).unwrap();
+        let err = decoder.end().expect_err("coinbase with 101-byte scriptSig should be rejected");
+
+        assert_eq!(
+            err,
+            TransactionDecoderError(TransactionDecoderErrorInner::CoinbaseScriptSigTooLarge(101))
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    #[cfg(feature = "hex")]
+    fn accept_coinbase_scriptsig_min_valid() {
+        // boundary test: 2 bytes is the minimum valid length
+        let tx_bytes = hex!("01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff025151ffffffff010000000000000000015100000000");
+
+        let mut decoder = Transaction::decoder();
+        let mut slice = tx_bytes.as_slice();
+        decoder.push_bytes(&mut slice).unwrap();
+        let tx = decoder.end().expect("coinbase with 2-byte scriptSig should be accepted");
+
+        assert_eq!(tx.inputs[0].script_sig.len(), 2);
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    #[cfg(feature = "hex")]
+    fn accept_coinbase_scriptsig_max_valid() {
+        // boundary test: 100 bytes is the maximum valid length
+        let tx_bytes = hex!("01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff6451515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151ffffffff010000000000000000015100000000");
+
+        let mut decoder = Transaction::decoder();
+        let mut slice = tx_bytes.as_slice();
+        decoder.push_bytes(&mut slice).unwrap();
+        let tx = decoder.end().expect("coinbase with 100-byte scriptSig should be accepted");
+
+        assert_eq!(tx.inputs[0].script_sig.len(), 100);
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    #[cfg(feature = "hex")]
+    fn reject_duplicate_inputs() {
+        // Test vector from Bitcoin Core tx_invalid.json:
+        // https://github.com/bitcoin/bitcoin/blob/master/src/test/data/tx_invalid.json#L50
+        // Transaction has two inputs both spending the same outpoint
+        let tx_bytes = hex!("01000000020001000000000000000000000000000000000000000000000000000000000000000000006c47304402204bb1197053d0d7799bf1b30cd503c44b58d6240cccbdc85b6fe76d087980208f02204beeed78200178ffc6c74237bb74b3f276bbb4098b5605d814304fe128bf1431012321039e8815e15952a7c3fada1905f8cf55419837133bd7756c0ef14fc8dfe50c0deaacffffffff0001000000000000000000000000000000000000000000000000000000000000000000006c47304402202306489afef52a6f62e90bf750bbcdf40c06f5c6b138286e6b6b86176bb9341802200dba98486ea68380f47ebb19a7df173b99e6bc9c681d6ccf3bde31465d1f16b3012321039e8815e15952a7c3fada1905f8cf55419837133bd7756c0ef14fc8dfe50c0deaacffffffff010000000000000000015100000000");
+
+        let mut decoder = Transaction::decoder();
+        let mut slice = tx_bytes.as_slice();
+        decoder.push_bytes(&mut slice).unwrap();
+        let err = decoder.end().expect_err("transaction with duplicate inputs should be rejected");
+
+        let expected_outpoint = OutPoint {
+            txid: Txid::from_byte_array([
+                0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00,
+            ]),
+            vout: 0,
+        };
+        assert_eq!(
+            err,
+            TransactionDecoderError(TransactionDecoderErrorInner::DuplicateInput(
+                expected_outpoint
+            ))
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    #[cfg(feature = "hex")]
+    fn reject_output_value_sum_too_large() {
+        // Test vector taken from Bitcoin Core tx_invalid.json
+        // https://github.com/bitcoin/bitcoin/blob/master/src/test/data/tx_invalid.json#L48
+        // "MAX_MONEY output + 1 output" (sum exceeds MAX_MONEY)
+        let tx_bytes = hex!("01000000010001000000000000000000000000000000000000000000000000000000000000000000006d483045022027deccc14aa6668e78a8c9da3484fbcd4f9dcc9bb7d1b85146314b21b9ae4d86022100d0b43dece8cfb07348de0ca8bc5b86276fa88f7f2138381128b7c36ab2e42264012321029bb13463ddd5d2cc05da6e84e37536cb9525703cfd8f43afdb414988987a92f6acffffffff020040075af075070001510001000000000000015100000000");
+
+        let mut decoder = Transaction::decoder();
+        let mut slice = tx_bytes.as_slice();
+        decoder.push_bytes(&mut slice).unwrap();
+        let err = decoder.end().expect_err("sum of output values > MAX_MONEY should be rejected");
+
+        assert!(matches!(err.0, TransactionDecoderErrorInner::OutputValueSumTooLarge(_)));
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    #[cfg(feature = "hex")]
+    fn accept_output_value_sum_equal_to_max_money() {
+        let tx_bytes = hex!("01000000010001000000000000000000000000000000000000000000000000000000000000000000006d483045022027deccc14aa6668e78a8c9da3484fbcd4f9dcc9bb7d1b85146314b21b9ae4d86022100d0b43dece8cfb07348de0ca8bc5b86276fa88f7f2138381128b7c36ab2e42264012321029bb13463ddd5d2cc05da6e84e37536cb9525703cfd8f43afdb414988987a92f6acffffffff020080c6a47e8d0300015100c040b571e80300015100000000");
+
+        let mut decoder = Transaction::decoder();
+        let mut slice = tx_bytes.as_slice();
+        decoder.push_bytes(&mut slice).unwrap();
+        let tx = decoder.end().expect("sum of output values == MAX_MONEY should be accepted");
+
+        let total: u64 = tx.outputs.iter().map(|o| o.amount.to_sat()).sum();
+        assert_eq!(total, Amount::MAX_MONEY.to_sat());
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    #[cfg(feature = "hex")]
+    fn reject_output_value_greater_than_max_money() {
+        // Test vector taken from Bitcoin Core tx_invalid.json
+        // https://github.com/bitcoin/bitcoin/blob/master/src/test/data/tx_invalid.json#L44
+        // "MAX_MONEY + 1 output"
+        let tx_bytes = hex!("01000000010001000000000000000000000000000000000000000000000000000000000000000000006e493046022100e1eadba00d9296c743cb6ecc703fd9ddc9b3cd12906176a226ae4c18d6b00796022100a71aef7d2874deff681ba6080f1b278bac7bb99c61b08a85f4311970ffe7f63f012321030c0588dc44d92bdcbf8e72093466766fdc265ead8db64517b0c542275b70fffbacffffffff010140075af0750700015100000000");
+
+        let mut decoder = Transaction::decoder();
+        let mut slice = tx_bytes.as_slice();
+        let result = decoder.push_bytes(&mut slice);
+        assert!(result.is_err(), "output value > MAX_MONEY should be rejected during decoding");
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    #[cfg(feature = "hex")]
+    fn reject_transaction_with_no_outputs() {
+        // Test vector taken from Bitcoin Core tx_invalid.json
+        // https://github.com/bitcoin/bitcoin/blob/master/src/test/data/tx_invalid.json#L36
+        // "No outputs"
+        let tx_bytes = hex!("01000000010001000000000000000000000000000000000000000000000000000000000000000000006d483045022100f16703104aab4e4088317c862daec83440242411b039d14280e03dd33b487ab802201318a7be236672c5c56083eb7a5a195bc57a40af7923ff8545016cd3b571e2a601232103c40e5d339df3f30bf753e7e04450ae4ef76c9e45587d1d993bdc4cd06f0651c7acffffffff0000000000");
+
+        let mut decoder = Transaction::decoder();
+        let mut slice = tx_bytes.as_slice();
+        decoder.push_bytes(&mut slice).unwrap();
+        let err = decoder.end().unwrap_err();
+        assert_eq!(err, TransactionDecoderError(TransactionDecoderErrorInner::NoOutputs));
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn compute_ntxid_ignores_script_sig_and_witness() {
+        let mut tx_in = TxIn::EMPTY_COINBASE;
+        tx_in.script_sig = ScriptSigBuf::from_bytes(vec![1, 2, 3]);
+        tx_in.witness = Witness::from_slice(&[&[0xAAu8][..]]);
+
+        let mut tx = Transaction {
+            version: Version::ONE,
+            lock_time: absolute::LockTime::ZERO,
+            inputs: vec![tx_in],
+            outputs: vec![TxOut { amount: Amount::ONE_SAT, script_pubkey: ScriptPubKeyBuf::new() }],
+        };
+
+        let ntxid = tx.compute_ntxid();
+
+        tx.inputs[0].script_sig = ScriptSigBuf::new();
+        tx.inputs[0].witness = Witness::default();
+
+        assert_eq!(ntxid, Ntxid::from_byte_array(tx.compute_txid().to_byte_array()));
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn transaction_decoder_push_bytes_after_done_is_false() {
+        let tx_bytes = [
+            0x01, 0x00, 0x00, 0x00, // version
+            0x01, // input count
+            // prevout.txid
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // prevout.vout
+            0x00, // script_sig len
+            0xff, 0xff, 0xff, 0xff, // sequence
+            0x01, // output count
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // value
+            0x00, // script_pubkey len
+            0x00, 0x00, 0x00, 0x00, // lock_time
+        ];
+
+        let mut decoder = TransactionDecoder::new();
+        let mut bytes = tx_bytes.as_slice();
+        assert!(decoder.push_bytes(&mut bytes).unwrap().is_ready());
+
+        let mut empty = [].as_slice();
+        assert!(decoder.push_bytes(&mut empty).unwrap().is_ready());
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn transaction_decoder_push_bytes_inputs_needs_more() {
+        use TransactionDecoderState as S;
+        let mut decoder = TransactionDecoder {
+            state: S::Inputs(Version::ONE, Attempt::First, VecDecoder::new()),
+        };
+        let mut bytes = [].as_slice();
+        assert!(decoder.push_bytes(&mut bytes).unwrap().needs_more());
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn transaction_decoder_push_bytes_lock_time_completes() {
+        use TransactionDecoderState as S;
+
+        let mut decoder = TransactionDecoder {
+            state: S::LockTime(
+                Version::ONE,
+                vec![],
+                vec![TxOut { amount: Amount::ONE_SAT, script_pubkey: ScriptPubKeyBuf::new() }],
+                LockTimeDecoder::new(),
+            ),
+        };
+        let mut bytes = [0u8, 0, 0, 0].as_slice();
+
+        assert!(decoder.push_bytes(&mut bytes).unwrap().is_ready());
+        assert!(bytes.is_empty());
+
+        let tx = decoder.end().unwrap();
+        assert_eq!(tx.lock_time, absolute::LockTime::ZERO);
+        assert!(tx.inputs.is_empty());
+        assert_eq!(tx.outputs.len(), 1);
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn transaction_decoder_push_bytes_lock_time_needs_more() {
+        use TransactionDecoderState as S;
+        let mut decoder = TransactionDecoder {
+            state: S::LockTime(
+                Version::ONE,
+                vec![],
+                vec![TxOut { amount: Amount::ONE_SAT, script_pubkey: ScriptPubKeyBuf::new() }],
+                LockTimeDecoder::new(),
+            ),
+        };
+        let mut bytes = [].as_slice();
+        assert!(decoder.push_bytes(&mut bytes).unwrap().needs_more());
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn transaction_decoder_push_bytes_outputs_needs_more() {
+        use TransactionDecoderState as S;
+        let mut decoder = TransactionDecoder {
+            state: S::Outputs(Version::ONE, vec![], IsSegwit::No, VecDecoder::new()),
+        };
+        let mut bytes = [].as_slice();
+        assert!(decoder.push_bytes(&mut bytes).unwrap().needs_more());
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn transaction_decoder_push_bytes_segwit_flag_empty_needs_more() {
+        use TransactionDecoderState as S;
+        let mut decoder = TransactionDecoder { state: S::SegwitFlag(Version::ONE) };
+        let mut bytes = [].as_slice();
+        assert!(decoder.push_bytes(&mut bytes).unwrap().needs_more());
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn transaction_decoder_push_bytes_version_needs_more() {
+        let mut decoder = TransactionDecoder::new();
+        let mut bytes = [].as_slice();
+        assert!(decoder.push_bytes(&mut bytes).unwrap().needs_more());
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn transaction_decoder_push_bytes_witnesses_needs_more() {
+        use TransactionDecoderState as S;
+        let tx_in = TxIn::EMPTY_COINBASE;
+        let mut decoder = TransactionDecoder {
+            state: S::Witnesses(
+                Version::ONE,
+                vec![tx_in],
+                vec![],
+                Iteration(0),
+                WitnessDecoder::new(),
+            ),
+        };
+        let mut bytes = [].as_slice();
+        assert!(decoder.push_bytes(&mut bytes).unwrap().needs_more());
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn transaction_decoder_rejects_unsupported_segwit_flag() {
+        let mut decoder = TransactionDecoder::new();
+        let mut bytes = [1u8, 0, 0, 0, 0, 2].as_slice();
+        let err = decoder.push_bytes(&mut bytes).unwrap_err();
+        assert!(matches!(err.0, TransactionDecoderErrorInner::UnsupportedSegwitFlag(2)));
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn transaction_end_rejects_null_prevout_at_nonzero_index() {
+        use TransactionDecoderState as S;
+
+        let input_0 = TxIn {
+            previous_output: OutPoint { txid: Txid::from_byte_array([1u8; 32]), vout: 0 },
+            script_sig: ScriptSigBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::default(),
+        };
+        let input_1 = TxIn {
+            previous_output: OutPoint::COINBASE_PREVOUT,
+            script_sig: ScriptSigBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::default(),
+        };
+        let tx = Transaction {
+            version: Version::ONE,
+            lock_time: absolute::LockTime::ZERO,
+            inputs: vec![input_0, input_1],
+            outputs: vec![TxOut { amount: Amount::ONE_SAT, script_pubkey: ScriptPubKeyBuf::new() }],
+        };
+
+        let decoder = TransactionDecoder { state: S::Done(tx) };
+        let err = decoder.end().unwrap_err();
+        assert!(matches!(err.0, TransactionDecoderErrorInner::NullPrevoutInNonCoinbase(1)));
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    #[allow(clippy::should_panic_without_expect)]
+    #[should_panic]
+    fn transaction_decoder_end_after_error_panics() {
+        use TransactionDecoderState as S;
+        let decoder = TransactionDecoder { state: S::Errored };
+        let _ = decoder.end();
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    #[allow(clippy::should_panic_without_expect)]
+    #[should_panic]
+    fn transaction_decoder_push_bytes_after_error_panics() {
+        use TransactionDecoderState as S;
+
+        let mut decoder = TransactionDecoder { state: S::Errored };
+        let mut bytes = [].as_slice();
+        let _ = decoder.push_bytes(&mut bytes);
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn txid_from_transaction_matches_compute_txid() {
+        let tx = Transaction {
+            version: Version::ONE,
+            lock_time: absolute::LockTime::ZERO,
+            inputs: vec![TxIn::EMPTY_COINBASE],
+            outputs: vec![TxOut { amount: Amount::ONE_SAT, script_pubkey: ScriptPubKeyBuf::new() }],
+        };
+
+        assert_eq!(Txid::from(&tx), tx.compute_txid());
+        assert_eq!(Txid::from(tx.clone()), tx.compute_txid());
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn wtxid_from_transaction_matches_compute_wtxid() {
+        let tx = Transaction {
+            version: Version::ONE,
+            lock_time: absolute::LockTime::ZERO,
+            inputs: vec![TxIn::EMPTY_COINBASE],
+            outputs: vec![TxOut { amount: Amount::ONE_SAT, script_pubkey: ScriptPubKeyBuf::new() }],
+        };
+
+        assert_eq!(Wtxid::from(&tx), tx.compute_wtxid());
+        assert_eq!(Wtxid::from(tx.clone()), tx.compute_wtxid());
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn witnesses_encoder_empty_inputs() {
+        let mut encoder = WitnessesEncoder::new(&[]);
+        encoding::check_encoder(&mut encoder, &[]);
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn out_point_decoder_default_read_limit() {
+        let decoder_default = OutPointDecoder::default();
+        // OutPointDecoder wraps ArrayDecoder<36>: needs 36 bytes.
+        assert_eq!(decoder_default.read_limit(), 36);
+
+        let mut decoder = OutPoint::decoder();
+        assert_eq!(decoder.read_limit(), 36);
+
+        // Provide 1 byte decreasing the limit by 1.
+        let mut bytes = [0u8].as_slice();
+        decoder.push_bytes(&mut bytes).unwrap();
+        assert_eq!(decoder.read_limit(), 35);
+
+        // Provide the remaining 35 bytes completing the decode.
+        let mut bytes = [0u8; 35].as_slice();
+        decoder.push_bytes(&mut bytes).unwrap();
+        assert_eq!(decoder.read_limit(), 0);
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn transaction_decoder_read_limit() {
+        use TransactionDecoderState as S;
+
+        let decoder = TransactionDecoder::default();
+        // Default TransactionDecoder starts by decoding version: needs 4 bytes.
+        assert_eq!(decoder.read_limit(), 4);
+
+        let decoder = TransactionDecoder {
+            state: S::Inputs(Version::ONE, Attempt::First, VecDecoder::<TxIn>::new()),
+        };
+        // VecDecoder<TxIn>: CompactSize needs 1 byte.
+        assert_eq!(decoder.read_limit(), 1);
+
+        let decoder = TransactionDecoder { state: S::SegwitFlag(Version::ONE) };
+        // Segwit flag: needs 1 byte.
+        assert_eq!(decoder.read_limit(), 1);
+
+        let decoder = TransactionDecoder {
+            state: S::Outputs(Version::ONE, vec![], IsSegwit::No, VecDecoder::<TxOut>::new()),
+        };
+        // VecDecoder<TxOut>: CompactSize needs 1 byte.
+        assert_eq!(decoder.read_limit(), 1);
+
+        let decoder = TransactionDecoder {
+            state: S::Witnesses(
+                Version::ONE,
+                vec![TxIn::EMPTY_COINBASE],
+                vec![],
+                Iteration(0),
+                WitnessDecoder::new(),
+            ),
+        };
+        // WitnessDecoder: CompactSize needs 1 byte.
+        assert_eq!(decoder.read_limit(), 1);
+
+        let decoder = TransactionDecoder {
+            state: S::LockTime(Version::ONE, vec![], vec![], LockTimeDecoder::new()),
+        };
+        // lock_time: needs 4 bytes.
+        assert_eq!(decoder.read_limit(), 4);
+
+        let tx = Transaction {
+            version: Version::ONE,
+            lock_time: absolute::LockTime::ZERO,
+            inputs: vec![TxIn::EMPTY_COINBASE],
+            outputs: vec![TxOut { amount: Amount::ONE_SAT, script_pubkey: ScriptPubKeyBuf::new() }],
+        };
+        let decoder = TransactionDecoder { state: S::Done(tx) };
+        // Done/Errored: no more bytes needed.
+        assert_eq!(decoder.read_limit(), 0);
+
+        let decoder = TransactionDecoder { state: S::Errored };
+        assert_eq!(decoder.read_limit(), 0);
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn txin_decoder_read_limit() {
+        let mut decoder = TxIn::decoder();
+        // Decoder3: needs outpoint (36) + script_sig len CompactSize (1) + sequence (4) = 41.
+        assert_eq!(decoder.read_limit(), 41);
+
+        // Provide the full outpoint, advancing to script_sig length.
+        let mut bytes = [0u8; 36].as_slice();
+        decoder.push_bytes(&mut bytes).unwrap();
+        // Remaining: needs script_sig len CompactSize (1) + sequence (4) = 5.
+        assert_eq!(decoder.read_limit(), 5);
+
+        // Set script_sig length = 0, advancing to sequence.
+        let mut bytes = [0x00u8].as_slice();
+        decoder.push_bytes(&mut bytes).unwrap();
+        // Sequence: needs 4 bytes.
+        assert_eq!(decoder.read_limit(), 4);
+
+        // Provide 1 byte of sequence.
+        let mut bytes = [0x00u8].as_slice();
+        decoder.push_bytes(&mut bytes).unwrap();
+        assert_eq!(decoder.read_limit(), 3);
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn txout_decoder_read_limit() {
+        let mut decoder = TxOut::decoder();
+        // Decoder2: needs amount (8) + script_pubkey len CompactSize (1) = 9.
+        assert_eq!(decoder.read_limit(), 9);
+
+        // Provide full amount, advancing to script_pubkey length.
+        let mut bytes = [0u8; 8].as_slice();
+        decoder.push_bytes(&mut bytes).unwrap();
+        // script_pubkey length: CompactSize needs 1 byte.
+        assert_eq!(decoder.read_limit(), 1);
+
+        // Set script_pubkey length = 0, completing the decode.
+        let mut bytes = [0x00u8].as_slice();
+        decoder.push_bytes(&mut bytes).unwrap();
+        assert_eq!(decoder.read_limit(), 0);
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn version_decoder_default_read_limit() {
+        let decoder_default = VersionDecoder::default();
+        // VersionDecoder wraps ArrayDecoder<4>: needs 4 bytes.
+        assert_eq!(decoder_default.read_limit(), 4);
+
+        let mut decoder = Version::decoder();
+        assert_eq!(decoder.read_limit(), 4);
+
+        // Provide 1 byte decreasing the limit by 1.
+        let mut bytes = [0u8].as_slice();
+        decoder.push_bytes(&mut bytes).unwrap();
+        assert_eq!(decoder.read_limit(), 3);
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn out_point_decoder_error() {
+        let mut decoder = OutPoint::decoder();
+        let mut slice = &[][..];
+
+        let status = decoder.push_bytes(&mut slice).unwrap();
+        assert!(status.needs_more());
+
+        let err = decoder.end().unwrap_err();
+        assert!(matches!(err, OutPointDecoderError(_)));
+
+        assert!(!err.to_string().is_empty());
+        #[cfg(feature = "std")]
+        assert!(err.source().is_some());
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    #[cfg(feature = "hex")]
+    fn parse_out_point_txid_error() {
+        let err = ("z".repeat(64) + ":0").parse::<OutPoint>().unwrap_err();
+        assert!(matches!(err, ParseOutPointError::Txid(_)));
+
+        assert!(!err.to_string().is_empty());
+        #[cfg(feature = "std")]
+        assert!(err.source().is_some());
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    #[cfg(feature = "hex")]
+    fn parse_out_point_vout_error() {
+        let txid = "0".repeat(64);
+
+        let err = format!("{}:{}", txid, "x").parse::<OutPoint>().unwrap_err();
+        assert!(matches!(err, ParseOutPointError::Vout(_)));
+
+        assert!(!err.to_string().is_empty());
+        #[cfg(feature = "std")]
+        assert!(err.source().is_some());
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    #[cfg(feature = "hex")]
+    fn parse_out_point_format_error() {
+        let txid = "0".repeat(64);
+        let err = txid.parse::<OutPoint>().unwrap_err();
+        assert!(matches!(err, ParseOutPointError::Format));
+
+        assert!(!err.to_string().is_empty());
+        #[cfg(feature = "std")]
+        assert!(err.source().is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    #[cfg(feature = "hex")]
+    fn parse_out_point_too_long_error() {
+        let txid = "0".repeat(64);
+        let err = format!("{}:{}", txid, "12345678900").parse::<OutPoint>().unwrap_err();
+        assert!(matches!(err, ParseOutPointError::TooLong));
+
+        assert!(!err.to_string().is_empty());
+        #[cfg(feature = "std")]
+        assert!(err.source().is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    #[cfg(feature = "hex")]
+    fn parse_out_point_vout_not_canonical_error() {
+        let txid = "0".repeat(64);
+        let err = format!("{}:{}", txid, "01").parse::<OutPoint>().unwrap_err();
+        assert!(matches!(err, ParseOutPointError::VoutNotCanonical));
+
+        assert!(!err.to_string().is_empty());
+        #[cfg(feature = "std")]
+        assert!(err.source().is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn version_decoder_error() {
+        let mut decoder = Version::decoder();
+        let mut slice = &[][..];
+
+        let status = decoder.push_bytes(&mut slice).unwrap();
+        assert!(status.needs_more());
+
+        let err = decoder.end().unwrap_err();
+        assert!(matches!(err, VersionDecoderError(_)));
+
+        assert!(!err.to_string().is_empty());
+        #[cfg(feature = "std")]
+        assert!(err.source().is_some());
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn transaction_decoder_version_error() {
+        let mut decoder = VersionDecoder::new();
+        let mut bytes = [0u8, 0, 0].as_slice();
+        assert!(decoder.push_bytes(&mut bytes).unwrap().needs_more());
+        let err = TransactionDecoderError(TransactionDecoderErrorInner::Version(
+            decoder.end().unwrap_err(),
+        ));
+        assert!(matches!(err.0, TransactionDecoderErrorInner::Version(_)));
+
+        assert!(!err.to_string().is_empty());
+        #[cfg(feature = "std")]
+        assert!(err.source().is_some());
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn transaction_decoder_unsupported_segwit_flag_error() {
+        let mut decoder = TransactionDecoder::new();
+        let mut bytes = [1u8, 0, 0, 0, 0, 2].as_slice();
+        let err = decoder.push_bytes(&mut bytes).unwrap_err();
+        assert!(matches!(err.0, TransactionDecoderErrorInner::UnsupportedSegwitFlag(2)));
+
+        assert!(!err.to_string().is_empty());
+        #[cfg(feature = "std")]
+        assert!(err.source().is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn transaction_decoder_inputs_error() {
+        let mut decoder = VecDecoder::<TxIn>::new();
+        let mut bytes = [1u8].as_slice();
+        assert!(decoder.push_bytes(&mut bytes).unwrap().needs_more());
+        let err = TransactionDecoderError(TransactionDecoderErrorInner::Inputs(
+            decoder.end().unwrap_err(),
+        ));
+        assert!(matches!(err.0, TransactionDecoderErrorInner::Inputs(_)));
+
+        assert!(!err.to_string().is_empty());
+        #[cfg(feature = "std")]
+        assert!(err.source().is_some());
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn transaction_decoder_outputs_error() {
+        let mut decoder = VecDecoder::<TxOut>::new();
+        let mut bytes = [1u8].as_slice();
+        assert!(decoder.push_bytes(&mut bytes).unwrap().needs_more());
+        let err = TransactionDecoderError(TransactionDecoderErrorInner::Outputs(
+            decoder.end().unwrap_err(),
+        ));
+        assert!(matches!(err.0, TransactionDecoderErrorInner::Outputs(_)));
+
+        assert!(!err.to_string().is_empty());
+        #[cfg(feature = "std")]
+        assert!(err.source().is_some());
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn transaction_decoder_witness_error() {
+        let mut decoder = WitnessDecoder::new();
+        let mut bytes = [1u8].as_slice();
+        assert!(decoder.push_bytes(&mut bytes).unwrap().needs_more());
+        let err = TransactionDecoderError(TransactionDecoderErrorInner::Witness(
+            decoder.end().unwrap_err(),
+        ));
+        assert!(matches!(err.0, TransactionDecoderErrorInner::Witness(_)));
+
+        assert!(!err.to_string().is_empty());
+        #[cfg(feature = "std")]
+        assert!(err.source().is_some());
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn transaction_decoder_no_witnesses_error() {
+        let tx_bytes = [
+            0x02, 0x00, 0x00, 0x00, // version
+            0x00, 0x01, // segwit marker + flag
+            0x01, // input count
+            // prevout.txid
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // prevout.vout
+            0x00, // script_sig len
+            0xff, 0xff, 0xff, 0xff, // sequence
+            0x01, // output count
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // value (1 sat)
+            0x00, // script_pubkey len
+            0x00, 0x00, 0x00, 0x00, // lock_time
+        ];
+
+        let mut slice = tx_bytes.as_slice();
+        let err = Transaction::decoder().push_bytes(&mut slice).unwrap_err();
+        assert!(matches!(err.0, TransactionDecoderErrorInner::NoWitnesses));
+
+        assert!(!err.to_string().is_empty());
+        #[cfg(feature = "std")]
+        assert!(err.source().is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn transaction_decoder_lock_time_error() {
+        let mut decoder = LockTimeDecoder::new();
+        let mut bytes = [0u8, 0, 0].as_slice();
+        assert!(decoder.push_bytes(&mut bytes).unwrap().needs_more());
+        let err = TransactionDecoderError(TransactionDecoderErrorInner::LockTime(
+            decoder.end().unwrap_err(),
+        ));
+        assert!(matches!(err.0, TransactionDecoderErrorInner::LockTime(_)));
+
+        assert!(!err.to_string().is_empty());
+        #[cfg(feature = "std")]
+        assert!(err.source().is_some());
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn transaction_decoder_early_end_version_error() {
+        let err = decode_error_from_bytes(&[0u8, 0, 0]);
+        assert!(matches!(err.0, TransactionDecoderErrorInner::EarlyEnd("version")));
+
+        assert!(!err.to_string().is_empty());
+        #[cfg(feature = "std")]
+        assert!(err.source().is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn transaction_decoder_early_end_inputs_error() {
+        let bytes = [
+            0x01, 0x00, 0x00, 0x00, // version
+        ];
+        let err = decode_error_from_bytes(&bytes);
+        assert!(matches!(err.0, TransactionDecoderErrorInner::EarlyEnd("inputs")));
+
+        assert!(!err.to_string().is_empty());
+        #[cfg(feature = "std")]
+        assert!(err.source().is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn transaction_decoder_early_end_segwit_flag_error() {
+        let bytes = [
+            0x01, 0x00, 0x00, 0x00, // version
+            0x00, // segwit marker (no flag)
+        ];
+        let err = decode_error_from_bytes(&bytes);
+        assert!(matches!(err.0, TransactionDecoderErrorInner::EarlyEnd("segwit flag")));
+
+        assert!(!err.to_string().is_empty());
+        #[cfg(feature = "std")]
+        assert!(err.source().is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn transaction_decoder_early_end_outputs_error() {
+        let bytes = [
+            0x01, 0x00, 0x00, 0x00, // version
+            0x01, // input count
+            // prevout.txid
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, // prevout.vout
+            0x00, 0x00, 0x00, 0x00, 0x00, // script_sig len
+            0xff, 0xff, 0xff, 0xff, // sequence
+        ];
+        let err = decode_error_from_bytes(&bytes);
+        assert!(matches!(err.0, TransactionDecoderErrorInner::EarlyEnd("outputs")));
+
+        assert!(!err.to_string().is_empty());
+        #[cfg(feature = "std")]
+        assert!(err.source().is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn transaction_decoder_early_end_witnesses_error() {
+        let tx_bytes = [
+            0x01, 0x00, 0x00, 0x00, // version
+            0x00, 0x01, // segwit marker + flag
+            0x01, // input count
+            // prevout.txid
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, // prevout.vout
+            0x00, 0x00, 0x00, 0x00, 0x00, // script_sig len
+            0xff, 0xff, 0xff, 0xff, // sequence
+            0x01, // output count
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // value (1 sat)
+            0x00, // script_pubkey len
+        ];
+
+        let err = decode_error_from_bytes(&tx_bytes);
+        assert!(matches!(err.0, TransactionDecoderErrorInner::EarlyEnd("witnesses")));
+
+        assert!(!err.to_string().is_empty());
+        #[cfg(feature = "std")]
+        assert!(err.source().is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn transaction_decoder_early_end_locktime_error() {
+        let tx_bytes = [
+            0x01, 0x00, 0x00, 0x00, // version
+            0x01, // input count
+            // prevout.txid
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, // prevout.vout
+            0x00, 0x00, 0x00, 0x00, 0x00, // script_sig len
+            0xff, 0xff, 0xff, 0xff, // sequence
+            0x01, // output count
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // value (1 sat)
+            0x00, // script_pubkey len
+        ];
+
+        let err = decode_error_from_bytes(&tx_bytes);
+        assert!(matches!(err.0, TransactionDecoderErrorInner::EarlyEnd("locktime")));
+
+        assert!(!err.to_string().is_empty());
+        #[cfg(feature = "std")]
+        assert!(err.source().is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn transaction_decoder_null_prevout_in_non_coinbase_error() {
+        let input_0 = TxIn::EMPTY_COINBASE;
+        let input_1 = TxIn {
+            previous_output: OutPoint { txid: Txid::from_byte_array([1u8; 32]), vout: 0 },
+            script_sig: ScriptSigBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::default(),
+        };
+        let tx = Transaction {
+            version: Version::ONE,
+            lock_time: absolute::LockTime::ZERO,
+            inputs: vec![input_0, input_1],
+            outputs: vec![TxOut { amount: Amount::ONE_SAT, script_pubkey: ScriptPubKeyBuf::new() }],
+        };
+
+        let err = decode_error_from_tx(&tx);
+        assert!(matches!(err.0, TransactionDecoderErrorInner::NullPrevoutInNonCoinbase(0)));
+
+        assert!(!err.to_string().is_empty());
+        #[cfg(feature = "std")]
+        assert!(err.source().is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn transaction_decoder_coinbase_script_sig_too_small_error() {
+        let input_0 = TxIn {
+            previous_output: OutPoint::COINBASE_PREVOUT,
+            script_sig: ScriptSigBuf::from_bytes(vec![0x51]),
+            sequence: Sequence::MAX,
+            witness: Witness::default(),
+        };
+        let tx = Transaction {
+            version: Version::ONE,
+            lock_time: absolute::LockTime::ZERO,
+            inputs: vec![input_0],
+            outputs: vec![TxOut { amount: Amount::ONE_SAT, script_pubkey: ScriptPubKeyBuf::new() }],
+        };
+
+        let err = decode_error_from_tx(&tx);
+        assert!(matches!(err.0, TransactionDecoderErrorInner::CoinbaseScriptSigTooSmall(1)));
+
+        assert!(!err.to_string().is_empty());
+        #[cfg(feature = "std")]
+        assert!(err.source().is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn transaction_decoder_coinbase_script_sig_too_large_error() {
+        let input_0 = TxIn {
+            previous_output: OutPoint::COINBASE_PREVOUT,
+            script_sig: ScriptSigBuf::from_bytes(vec![0x51; 101]),
+            sequence: Sequence::MAX,
+            witness: Witness::default(),
+        };
+        let tx = Transaction {
+            version: Version::ONE,
+            lock_time: absolute::LockTime::ZERO,
+            inputs: vec![input_0],
+            outputs: vec![TxOut { amount: Amount::ONE_SAT, script_pubkey: ScriptPubKeyBuf::new() }],
+        };
+
+        let err = decode_error_from_tx(&tx);
+        assert!(matches!(err.0, TransactionDecoderErrorInner::CoinbaseScriptSigTooLarge(101)));
+
+        assert!(!err.to_string().is_empty());
+        #[cfg(feature = "std")]
+        assert!(err.source().is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn transaction_decoder_duplicate_input_error() {
+        let outpoint = OutPoint { txid: Txid::from_byte_array([2u8; 32]), vout: 1 };
+        let input_0 = TxIn {
+            previous_output: outpoint,
+            script_sig: ScriptSigBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::default(),
+        };
+        let input_1 = input_0.clone();
+        let tx = Transaction {
+            version: Version::ONE,
+            lock_time: absolute::LockTime::ZERO,
+            inputs: vec![input_0, input_1],
+            outputs: vec![TxOut { amount: Amount::ONE_SAT, script_pubkey: ScriptPubKeyBuf::new() }],
+        };
+
+        let err = decode_error_from_tx(&tx);
+        assert!(matches!(
+            err.0,
+            TransactionDecoderErrorInner::DuplicateInput(got) if got == outpoint
+        ));
+
+        assert!(!err.to_string().is_empty());
+        #[cfg(feature = "std")]
+        assert!(err.source().is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn transaction_decoder_output_value_sum_too_large_error() {
+        let expected = Amount::MAX_MONEY.to_sat() + 1;
+        let tx = Transaction {
+            version: Version::ONE,
+            lock_time: absolute::LockTime::ZERO,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: Txid::from_byte_array([1u8; 32]), vout: 0 },
+                script_sig: ScriptSigBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            outputs: vec![
+                TxOut { amount: Amount::MAX_MONEY, script_pubkey: ScriptPubKeyBuf::new() },
+                TxOut { amount: Amount::ONE_SAT, script_pubkey: ScriptPubKeyBuf::new() },
+            ],
+        };
+
+        let err = decode_error_from_tx(&tx);
+        assert!(matches!(
+            err.0,
+            TransactionDecoderErrorInner::OutputValueSumTooLarge(got) if got == expected
+        ));
+
+        assert!(!err.to_string().is_empty());
+        #[cfg(feature = "std")]
+        assert!(err.source().is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn transaction_decoder_no_outputs_error() {
+        let tx = Transaction {
+            version: Version::ONE,
+            lock_time: absolute::LockTime::ZERO,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: Txid::from_byte_array([1u8; 32]), vout: 0 },
+                script_sig: ScriptSigBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            outputs: vec![],
+        };
+
+        let err = decode_error_from_tx(&tx);
+        assert!(matches!(err.0, TransactionDecoderErrorInner::NoOutputs));
+
+        assert!(!err.to_string().is_empty());
+        #[cfg(feature = "std")]
+        assert!(err.source().is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn txin_decoder_first_error() {
+        let mut decoder = TxIn::decoder();
+        let mut slice = [].as_slice();
+        assert!(decoder.push_bytes(&mut slice).unwrap().needs_more());
+
+        let err = decoder.end().unwrap_err();
+        assert!(matches!(err.0, encoding::Decoder3Error::First(_)));
+
+        assert!(!err.to_string().is_empty());
+        #[cfg(feature = "std")]
+        assert!(err.source().is_some());
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn txin_decoder_second_error() {
+        let mut bytes = vec![];
+        bytes.extend_from_slice(&TC_TXID_BYTES);
+        bytes.extend_from_slice(&TC_VOUT_BYTES);
+        bytes.push(1); // scriptSig length = 1
+
+        let mut decoder = TxIn::decoder();
+        let mut slice = bytes.as_slice();
+
+        assert!(decoder.push_bytes(&mut slice).unwrap().needs_more());
+
+        let err = decoder.end().unwrap_err();
+        assert!(matches!(err.0, encoding::Decoder3Error::Second(_)));
+
+        assert!(!err.to_string().is_empty());
+        #[cfg(feature = "std")]
+        assert!(err.source().is_some());
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn txin_decoder_third_error() {
+        let mut bytes = vec![];
+        bytes.extend_from_slice(&TC_TXID_BYTES);
+        bytes.extend_from_slice(&TC_VOUT_BYTES);
+        bytes.push(0); // scriptSig length = 0
+
+        let mut decoder = TxIn::decoder();
+        let mut slice = bytes.as_slice();
+
+        assert!(decoder.push_bytes(&mut slice).unwrap().needs_more());
+
+        let err = decoder.end().unwrap_err();
+        assert!(matches!(err.0, encoding::Decoder3Error::Third(_)));
+
+        assert!(!err.to_string().is_empty());
+        #[cfg(feature = "std")]
+        assert!(err.source().is_some());
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn txout_decoder_first_error() {
+        let mut decoder = TxOut::decoder();
+        let mut slice = [].as_slice();
+        assert!(decoder.push_bytes(&mut slice).unwrap().needs_more());
+
+        let err = decoder.end().unwrap_err();
+        assert!(matches!(err.0, encoding::Decoder2Error::First(_)));
+
+        assert!(!err.to_string().is_empty());
+        #[cfg(feature = "std")]
+        assert!(err.source().is_some());
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn txout_decoder_second_error() {
+        let mut bytes = vec![];
+        bytes.extend_from_slice(&TC_ONE_SAT_BYTES);
+        let mut decoder = TxOut::decoder();
+        let mut slice = bytes.as_slice();
+
+        assert!(decoder.push_bytes(&mut slice).unwrap().needs_more());
+
+        let err = decoder.end().unwrap_err();
+        assert!(matches!(err.0, encoding::Decoder2Error::Second(_)));
+
+        assert!(!err.to_string().is_empty());
+        #[cfg(feature = "std")]
+        assert!(err.source().is_some());
+    }
+
+    // Helper function to decode a transaction from bytes and return the decoding error.
+    #[cfg(feature = "alloc")]
+    fn decode_error_from_bytes(bytes: &[u8]) -> TransactionDecoderError {
+        let mut decoder = TransactionDecoder::new();
+        let mut slice = bytes;
+        decoder.push_bytes(&mut slice).unwrap();
+        decoder.end().unwrap_err()
+    }
+
+    // Helper function to encode a transaction and decode it to get the decoding error.
+    #[cfg(feature = "alloc")]
+    fn decode_error_from_tx(tx: &Transaction) -> TransactionDecoderError {
+        let tx_bytes = encoding::encode_to_vec(tx);
+        decode_error_from_bytes(&tx_bytes)
+    }
+
+    #[test]
+    #[cfg(feature = "hex")]
+    fn txin() {
+        let txin: Result<TxIn, _> = encoding::decode_from_slice(&hex!("a15d57094aa7a21a28cb20b59aab8fc7d1149a3bdbcddba9c622e4f5f6a99ece010000006c493046022100f93bb0e7d8db7bd46e40132d1f8242026e045f03a0efe71bbb8e3f475e970d790221009337cd7f1f929f00cc6ff01f03729b069a7c21b59b1736ddfee5db5946c5da8c0121033b9b137ee87d5a812d6f506efdd37f0affa7ffc310711c06c7f3e097c9447c52ffffffff"));
+        assert!(txin.is_ok());
+    }
+
+    #[test]
+    #[cfg(feature = "hex")]
+    fn segwit_invalid_transaction() {
+        let tx_bytes = hex!("0000fd000001021921212121212121212121f8b372b0239cc1dff600000000004f4f4f4f4f4f4f4f000000000000000000000000000000333732343133380d000000000000000000000000000000ff000000000009000dff000000000000000800000000000000000d");
+        let tx: Result<Transaction, _> = encoding::decode_from_slice(&tx_bytes);
+        assert!(tx.is_err());
+    }
+
+    #[test]
+    #[cfg(feature = "hex")]
+    fn transaction_version() {
+        let tx_bytes = hex!("ffffffff0100000000000000000000000000000000000000000000000000000000000000000000000000ffffffff0100f2052a01000000434104678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5fac00000000");
+        let tx: Result<Transaction, _> = encoding::decode_from_slice(&tx_bytes);
+        assert!(tx.is_ok());
+        let realtx = tx.unwrap();
+        assert_eq!(realtx.version, Version::maybe_non_standard(u32::MAX));
+    }
+
+    #[test]
+    #[cfg(feature = "hex")]
+    fn tx_no_input_deserialization() {
+        let tx_bytes = hex!(
+            "010000000001000100e1f505000000001976a9140389035a9225b3839e2bbf32d826a1e222031fd888ac00000000"
+        );
+        let tx: Transaction = encoding::decode_from_slice(&tx_bytes).expect("deserialize tx");
+
+        assert_eq!(tx.inputs.len(), 0);
+        assert_eq!(tx.outputs.len(), 1);
+
+        let reser = encoding::encode_to_vec(&tx);
+        assert_eq!(&tx_bytes[..], reser.as_slice());
+    }
+
+    #[test]
+    #[cfg(feature = "hex")]
+    fn ntxid() {
+        let tx_bytes = hex!("0100000001a15d57094aa7a21a28cb20b59aab8fc7d1149a3bdbcddba9c622e4f5f6a99ece010000006c493046022100f93bb0e7d8db7bd46e40132d1f8242026e045f03a0efe71bbb8e3f475e970d790221009337cd7f1f929f00cc6ff01f03729b069a7c21b59b1736ddfee5db5946c5da8c0121033b9b137ee87d5a812d6f506efdd37f0affa7ffc310711c06c7f3e097c9447c52ffffffff0100e1f505000000001976a9140389035a9225b3839e2bbf32d826a1e222031fd888ac00000000");
+        let mut tx: Transaction = encoding::decode_from_slice(&tx_bytes).unwrap();
+
+        let old_ntxid = tx.compute_ntxid();
+        assert_eq!(
+            format!("{:x}", old_ntxid),
+            "c3573dbea28ce24425c59a189391937e00d255150fa973d59d61caf3a06b601d"
+        );
+        // changing sigs does not affect it
+        tx.inputs[0].script_sig = ScriptSigBuf::new();
+        assert_eq!(old_ntxid, tx.compute_ntxid());
+        // changing pks does
+        tx.outputs[0].script_pubkey = ScriptPubKeyBuf::new();
+        assert!(old_ntxid != tx.compute_ntxid());
+    }
+}

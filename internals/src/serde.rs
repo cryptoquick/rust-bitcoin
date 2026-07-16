@@ -1,64 +1,67 @@
 //! Contains extensions of `serde` and internal reexports.
 
-#[cfg(feature = "serde")]
 #[doc(hidden)]
 pub use serde::{de, ser, Deserialize, Deserializer, Serialize, Serializer};
 
-/// Converts given error type to a type implementing [`de::Error`].
+/// Implements `serde::Serialize` by way of `Display`.
 ///
-/// This is used in [`Deserialize`] implementations to convert specialized errors into serde
-/// errors.
-#[cfg(feature = "serde")]
-pub trait IntoDeError: Sized {
-    /// Converts to deserializer error possibly outputting vague message.
-    ///
-    /// This method is allowed to return a vague error message if the error type doesn't contain
-    /// enough information to explain the error precisely.
-    fn into_de_error<E: de::Error>(self, expected: Option<&dyn de::Expected>) -> E;
-
-    /// Converts to deserializer error without outputting vague message.
-    ///
-    /// If the error type doesn't contain enough information to explain the error precisely this
-    /// should return `Err(self)` allowing the caller to use its information instead.
-    fn try_into_de_error<E>(self, expected: Option<&dyn de::Expected>) -> Result<E, Self>
-    where
-        E: de::Error,
-    {
-        Ok(self.into_de_error(expected))
-    }
-}
-
-#[cfg(feature = "serde")]
-mod impls {
-    use super::*;
-
-    impl IntoDeError for core::convert::Infallible {
-        fn into_de_error<E: de::Error>(self, _expected: Option<&dyn de::Expected>) -> E {
-            match self {}
-        }
-    }
-
-    impl IntoDeError for core::num::ParseIntError {
-        fn into_de_error<E: de::Error>(self, expected: Option<&dyn de::Expected>) -> E {
-            self.try_into_de_error(expected).unwrap_or_else(|_| {
-                let expected = expected.unwrap_or(&"an integer");
-
-                E::custom(format_args!("invalid string, expected {}", expected))
-            })
-        }
-
-        fn try_into_de_error<E>(self, expected: Option<&dyn de::Expected>) -> Result<E, Self>
-        where
-            E: de::Error,
-        {
-            use core::num::IntErrorKind::Empty;
-
-            let expected = expected.unwrap_or(&"an integer");
-
-            match self.kind() {
-                Empty => Ok(E::invalid_value(de::Unexpected::Str(""), expected)),
-                _ => Err(self),
+/// `$name` is required to implement `core::fmt::Display`.
+#[macro_export]
+macro_rules! serde_string_serialize_impl {
+    ($name:ty, $expecting:literal) => {
+        impl $crate::serde::Serialize for $name {
+            fn serialize<S>(&self, serializer: S) -> core::result::Result<S::Ok, S::Error>
+            where
+                S: $crate::serde::Serializer,
+            {
+                serializer.collect_str(&self)
             }
         }
-    }
+    };
+}
+
+/// Implements `serde::Deserialize` by way of `FromStr`.
+///
+/// `$name` is required to implement `core::str::FromStr`.
+#[macro_export]
+macro_rules! serde_string_deserialize_impl {
+    ($name:ty, $expecting:literal) => {
+        impl<'de> $crate::serde::Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> core::result::Result<$name, D::Error>
+            where
+                D: $crate::serde::de::Deserializer<'de>,
+            {
+                use core::fmt::Formatter;
+
+                struct Visitor;
+                impl<'de> $crate::serde::de::Visitor<'de> for Visitor {
+                    type Value = $name;
+
+                    fn expecting(&self, f: &mut Formatter) -> core::fmt::Result {
+                        f.write_str($expecting)
+                    }
+
+                    fn visit_str<E>(self, v: &str) -> core::result::Result<Self::Value, E>
+                    where
+                        E: $crate::serde::de::Error,
+                    {
+                        v.parse::<$name>().map_err(E::custom)
+                    }
+                }
+
+                deserializer.deserialize_str(Visitor)
+            }
+        }
+    };
+}
+
+/// Implements `serde::Serialize` and `Deserialize` by way of `Display` and `FromStr` respectively.
+///
+/// `$name` is required to implement `core::fmt::Display` and `core::str::FromStr`.
+#[macro_export]
+macro_rules! serde_string_impl {
+    ($name:ty, $expecting:literal) => {
+        $crate::serde_string_deserialize_impl!($name, $expecting);
+        $crate::serde_string_serialize_impl!($name, $expecting);
+    };
 }

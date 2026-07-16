@@ -1,212 +1,241 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! Non-public macros
-
-macro_rules! arr_newtype_fmt_impl {
-    ($ty:ident, $bytes:expr $(, $gen:ident: $gent:ident)*) => {
-        impl<$($gen: $gent),*> $crate::_export::_core::fmt::LowerHex for $ty<$($gen),*> {
-            #[inline]
-            fn fmt(&self, f: &mut $crate::_export::_core::fmt::Formatter) -> $crate::_export::_core::fmt::Result {
-                #[allow(unused)]
-                use crate::Hash as _;
-                let case = $crate::hex::Case::Lower;
-                if <$ty<$($gen),*>>::DISPLAY_BACKWARD {
-                    $crate::hex::fmt_hex_exact!(f, $bytes, self.0.iter().rev(), case)
-                } else {
-                    $crate::hex::fmt_hex_exact!(f, $bytes, self.0.iter(), case)
-                }
-            }
-        }
-
-        impl<$($gen: $gent),*> $crate::_export::_core::fmt::UpperHex for $ty<$($gen),*> {
-            #[inline]
-            fn fmt(&self, f: &mut $crate::_export::_core::fmt::Formatter) -> $crate::_export::_core::fmt::Result {
-                #[allow(unused)]
-                use crate::Hash as _;
-                let case = $crate::hex::Case::Upper;
-                if <$ty<$($gen),*>>::DISPLAY_BACKWARD {
-                    $crate::hex::fmt_hex_exact!(f, $bytes, self.0.iter().rev(), case)
-                } else {
-                    $crate::hex::fmt_hex_exact!(f, $bytes, self.0.iter(), case)
-                }
-            }
-        }
-
-        impl<$($gen: $gent),*> $crate::_export::_core::fmt::Display for $ty<$($gen),*> {
-            #[inline]
-            fn fmt(&self, f: &mut $crate::_export::_core::fmt::Formatter) -> $crate::_export::_core::fmt::Result {
-                $crate::_export::_core::fmt::LowerHex::fmt(self, f)
-            }
-        }
-
-        impl<$($gen: $gent),*> $crate::_export::_core::fmt::Debug for $ty<$($gen),*> {
-            #[inline]
-            fn fmt(&self, f: &mut $crate::_export::_core::fmt::Formatter) -> $crate::_export::_core::fmt::Result {
-                write!(f, "{:#}", self)
-            }
-        }
-    }
-}
-pub(crate) use arr_newtype_fmt_impl;
+//! Non-public macros.
 
 /// Adds trait impls to the type called `Hash` in the current scope.
 ///
-/// Implpements various conversion traits as well as the [`crate::Hash`] trait.
-/// Arguments:
+/// Implements various conversion traits as well as the [`crate::Hash`] trait.
 ///
-/// * `$bits` - number of bits this hash type has
-/// * `$reverse` - `bool`  - `true` if the hash type should be displayed backwards, `false`
-///    otherwise.
-/// * `$gen: $gent` - generic type(s) and trait bound(s)
+/// # Parameters
+///
+/// * `$bits` - the number of bits this hash type has
+/// * `$reverse` - `bool`, `true` if the hash type should be displayed backwards, `false` otherwise.
+/// * `$gen: $gent` - the generic type(s) and trait bound(s)
 ///
 /// Restrictions on usage:
 ///
-/// * There must be a free-standing `fn from_engine(HashEngine) -> Hash` in the scope
-/// * `fn internal_new([u8; $bits / 8]) -> Self` must exist on `Hash`
-/// * `fn internal_engine() -> HashEngine` must exist on `Hash`
-///
-/// `from_engine` obviously implements the finalization algorithm.
-/// `internal_new` is required so that types with more than one field are constructible.
-/// `internal_engine` is required to initialize the engine for given hash type.
+/// * The `Hash` type in scope must provide `from_byte_array`, `to_byte_array`, and
+///   `as_byte_array` (e.g., via `hash_type_no_default!`).
 macro_rules! hash_trait_impls {
     ($bits:expr, $reverse:expr $(, $gen:ident: $gent:ident)*) => {
-        impl<$($gen: $gent),*> Hash<$($gen),*> {
-            /// Zero cost conversion between a fixed length byte array shared reference and
-            /// a shared reference to this Hash type.
-            pub fn from_bytes_ref(bytes: &[u8; $bits / 8]) -> &Self {
-                // Safety: Sound because Self is #[repr(transparent)] containing [u8; $bits / 8]
-                unsafe { &*(bytes as *const _ as *const Self) }
-            }
+        $crate::impl_bytelike_traits!(Hash, { $bits / 8 } $(, $gen: $gent)*);
+        #[cfg(feature = "hex")]
+        $crate::impl_hex_string_traits!(Hash, { $bits / 8 }, $reverse $(, $gen: $gent)*);
+        #[cfg(not(feature = "hex"))]
+        $crate::impl_debug_only!(Hash, { $bits / 8 }, $reverse $(, $gen: $gent)*);
 
-            /// Zero cost conversion between a fixed length byte array exclusive reference and
-            /// an exclusive reference to this Hash type.
-            pub fn from_bytes_mut(bytes: &mut [u8; $bits / 8]) -> &mut Self {
-                // Safety: Sound because Self is #[repr(transparent)] containing [u8; $bits / 8]
-                unsafe { &mut *(bytes as *mut _ as *mut Self) }
-            }
-        }
+        #[cfg(feature = "serde")]
+        $crate::impl_serde_traits!(Hash, { $bits / 8} $(, $gen: $gent)*);
 
-        impl<$($gen: $gent),*> str::FromStr for Hash<$($gen),*> {
-            type Err = $crate::hex::HexToArrayError;
-            fn from_str(s: &str) -> $crate::_export::_core::result::Result<Self, Self::Err> {
-                use $crate::{Hash, hex::{FromHex}};
-
-                let mut bytes = <[u8; $bits / 8]>::from_hex(s)?;
-                if $reverse {
-                    bytes.reverse();
-                }
-                Ok(Self::from_byte_array(bytes))
-            }
-        }
-
-        $crate::internal_macros::arr_newtype_fmt_impl!(Hash, $bits / 8 $(, $gen: $gent)*);
-        serde_impl!(Hash, $bits / 8 $(, $gen: $gent)*);
-        borrow_slice_impl!(Hash $(, $gen: $gent)*);
-
-        impl<$($gen: $gent),*> $crate::_export::_core::convert::AsRef<[u8; $bits / 8]> for Hash<$($gen),*> {
-            fn as_ref(&self) -> &[u8; $bits / 8] {
-                &self.0
-            }
-        }
-
-        impl<I: SliceIndex<[u8]> $(, $gen: $gent)*> Index<I> for Hash<$($gen),*> {
-            type Output = I::Output;
-
-            #[inline]
-            fn index(&self, index: I) -> &Self::Output {
-                &self.0[index]
-            }
-        }
-
-        impl<$($gen: $gent),*> crate::Hash for Hash<$($gen),*> {
-            type Engine = HashEngine;
+        impl<$($gen: $gent),*> $crate::Hash for Hash<$($gen),*> {
             type Bytes = [u8; $bits / 8];
 
-            const LEN: usize = $bits / 8;
             const DISPLAY_BACKWARD: bool = $reverse;
 
-            fn engine() -> Self::Engine {
-                Self::internal_engine()
-            }
+            fn from_byte_array(bytes: Self::Bytes) -> Self { Self::from_byte_array(bytes) }
 
-            fn from_engine(e: HashEngine) -> Hash<$($gen),*> {
-                from_engine(e)
-            }
+            fn to_byte_array(self) -> Self::Bytes { self.to_byte_array() }
 
-            fn from_slice(sl: &[u8]) -> $crate::_export::_core::result::Result<Hash<$($gen),*>, FromSliceError> {
-                if sl.len() != $bits / 8 {
-                    Err(FromSliceError{expected: Self::LEN, got: sl.len()})
-                } else {
-                    let mut ret = [0; $bits / 8];
-                    ret.copy_from_slice(sl);
-                    Ok(Self::internal_new(ret))
-                }
-            }
-
-            fn to_byte_array(self) -> Self::Bytes {
-                self.0
-            }
-
-            fn as_byte_array(&self) -> &Self::Bytes {
-                &self.0
-            }
-
-            fn from_byte_array(bytes: Self::Bytes) -> Self {
-                Self::internal_new(bytes)
-            }
-
-            fn all_zeros() -> Self {
-                Hash::internal_new([0x00; $bits / 8])
-            }
+            fn as_byte_array(&self) -> &Self::Bytes { self.as_byte_array() }
         }
     }
 }
 pub(crate) use hash_trait_impls;
 
-/// Creates a type called `Hash` and implements standard interface for it.
+/// Constructs a type called `Hash` and implements the standard general hashing interface for it.
 ///
-/// The created type will have all standard derives, `Hash` impl and implementation of
-/// `internal_engine` returning default. The created type has a single field.
+/// The created type has a single field and will have all standard derives as well as an
+/// implementation of [`crate::Hash`].
 ///
-/// Arguments:
+/// # Syntax
 ///
-/// * `$bits` - the number of bits of the hash type
-/// * `$reverse` - `true` if the hash should be displayed backwards, `false` otherwise
-/// * `$doc` - doc string to put on the type
-/// * `$schemars` - a literal that goes into `schema_with`.
+/// ```ignore
+/// // Requires a `HashEngine` type in scope.
+/// general_hash_type! {
+///     /// Documentation for the hash type.
+///     pub struct Hash([u8; 32]);
 ///
-/// The `from_engine` free-standing function is still required with this macro. See the doc of
-/// [`hash_trait_impls`].
-macro_rules! hash_type {
-    ($bits:expr, $reverse:expr, $doc:literal) => {
-        #[doc = $doc]
-        #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-        #[repr(transparent)]
-        pub struct Hash([u8; $bits / 8]);
+///     const DISPLAY_BACKWARD: bool = false;
+/// }
+/// ```
+///
+/// Restrictions on usage:
+///
+/// * Requires a `HashEngine` type in this module implementing `Default`.
+macro_rules! general_hash_type {
+    (
+        $(#[$type_attrs:meta])*
+        pub struct Hash([u8; $len:expr]);
 
-        impl Hash {
-            fn internal_new(arr: [u8; $bits / 8]) -> Self { Hash(arr) }
+        const DISPLAY_BACKWARD: bool = $reverse:expr;
+    ) => {
+        /// Hashes some bytes.
+        pub fn hash(data: &[u8]) -> Hash {
+            use crate::HashEngine as _;
 
-            fn internal_engine() -> HashEngine { Default::default() }
+            let mut engine = Hash::engine();
+            engine.input(data);
+            engine.finalize()
         }
 
-        #[cfg(feature = "schemars")]
-        impl schemars::JsonSchema for Hash {
-            fn schema_name() -> String { "Hash".to_owned() }
+        /// Hashes all the byte slices retrieved from the iterator together.
+        pub fn hash_byte_chunks<B, I>(byte_slices: I) -> Hash
+        where
+            B: AsRef<[u8]>,
+            I: IntoIterator<Item = B>,
+        {
+            use crate::HashEngine as _;
 
-            fn json_schema(gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
-                let len = $bits / 8;
-                let mut schema: schemars::schema::SchemaObject = <String>::json_schema(gen).into();
-                schema.string = Some(Box::new(schemars::schema::StringValidation {
-                    max_length: Some(len * 2),
-                    min_length: Some(len * 2),
-                    pattern: Some("[0-9a-fA-F]+".to_owned()),
-                }));
-                schema.into()
+            let mut engine = Hash::engine();
+            for slice in byte_slices {
+                engine.input(slice.as_ref());
+            }
+            engine.finalize()
+        }
+
+        $crate::internal_macros::hash_type_no_default! {
+            $(#[$type_attrs])*
+            pub struct Hash([u8; $len]);
+
+            const DISPLAY_BACKWARD: bool = $reverse;
+        }
+
+        impl Hash {
+            /// Constructs a new engine.
+            pub fn engine() -> HashEngine { Default::default() }
+
+            /// Hashes some bytes.
+            #[allow(clippy::self_named_constructors)] // Hash is a noun and a verb.
+            pub fn hash(data: &[u8]) -> Self { hash(data) }
+
+            /// Hashes all the byte slices retrieved from the iterator together.
+            pub fn hash_byte_chunks<B, I>(byte_slices: I) -> Self
+            where
+                B: AsRef<[u8]>,
+                I: IntoIterator<Item = B>,
+            {
+                hash_byte_chunks(byte_slices)
             }
         }
 
-        crate::internal_macros::hash_trait_impls!($bits, $reverse);
+        #[cfg(feature = "arbitrary")]
+        impl<'a> arbitrary::Arbitrary<'a> for Hash {
+            fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+                Ok(Self(u.arbitrary()?))
+            }
+        }
     };
 }
-pub(crate) use hash_type;
+pub(crate) use general_hash_type;
+
+macro_rules! hash_type_no_default {
+    (
+        $(#[$type_attrs:meta])*
+        pub struct Hash([u8; $len:expr]);
+
+        const DISPLAY_BACKWARD: bool = $reverse:expr;
+    ) => {
+        // Defined in `REPO_DIR/include/newtype.rs`.
+        crate::transparent_newtype! {
+            $(#[$type_attrs])*
+            #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+            pub struct Hash([u8; $len]);
+
+            impl Hash {
+                /// Zero cost conversion between a fixed length byte array shared reference and
+                /// a shared reference to this Hash type.
+                pub fn from_bytes_ref(bytes: &_) -> &Self;
+
+                /// Zero cost conversion between a fixed length byte array exclusive reference and
+                /// an exclusive reference to this Hash type.
+                pub fn from_bytes_mut(bytes: &mut _) -> &mut Self;
+            }
+        }
+
+        impl Hash {
+            /// Constructs a new hash from the underlying byte array.
+            pub const fn from_byte_array(bytes: [u8; $len]) -> Self { Hash(bytes) }
+
+            /// Returns the underlying byte array.
+            pub const fn to_byte_array(self) -> [u8; $len] { self.0 }
+
+            /// Returns a reference to the underlying byte array.
+            pub const fn as_byte_array(&self) -> &[u8; $len] { &self.0 }
+        }
+
+        // Parenthesize `$len` so additive expressions still map to the intended bit width.
+        $crate::internal_macros::hash_trait_impls!(($len) * 8, $reverse);
+
+        $crate::internal_macros::impl_write!(
+            HashEngine,
+            |us: &mut HashEngine, buf| {
+                crate::HashEngine::input(us, buf);
+                Ok(buf.len())
+            },
+            |_us| { Ok(()) }
+        );
+    };
+}
+pub(crate) use hash_type_no_default;
+
+macro_rules! impl_write {
+    ($ty: ty, $write_fn: expr, $flush_fn: expr $(, $bounded_ty: ident : $bounds: path),*) => {
+        // `bitcoin_io::Write` is implemented in `bitcoin_io`.
+        #[cfg(feature = "std")]
+        impl<$($bounded_ty: $bounds),*> std::io::Write for $ty {
+            #[inline]
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                $write_fn(self, buf)
+            }
+
+            #[inline]
+            fn flush(&mut self) -> std::io::Result<()> {
+                $flush_fn(self)
+            }
+        }
+    }
+}
+pub(crate) use impl_write;
+
+macro_rules! impl_engine_input {
+    () => {
+        #[cfg(not(hashes_fuzz))]
+        fn input(&mut self, mut inp: &[u8]) {
+            let buf_idx = $crate::incomplete_block_len(self);
+            let block_size = <Self as crate::HashEngine>::BLOCK_SIZE;
+            self.bytes_hashed += inp.len() as u64;
+
+            // we know we won't complete a block, so just copy into the buffer and return
+            if buf_idx + inp.len() < block_size {
+                return self.buffer[buf_idx..buf_idx + inp.len()].copy_from_slice(&inp);
+            }
+
+            // we'll process at least one block.
+            // if there's a partial buffer, complete it and process it
+            if buf_idx > 0 {
+                let needed = block_size - buf_idx;
+                self.buffer[buf_idx..buf_idx + needed].copy_from_slice(&inp[..needed]);
+                Self::process_blocks(&mut self.h, &self.buffer);
+                inp = &inp[needed..]
+            }
+
+            // pass remaining full blocks directly to process_blocks from the input (zero copy)
+            let full_blocks = inp.len() / block_size * block_size;
+            if full_blocks > 0 {
+                Self::process_blocks(&mut self.h, &inp[..full_blocks])
+            }
+
+            // buffer the remainder
+            self.buffer[..inp.len() - full_blocks].copy_from_slice(&inp[full_blocks..])
+        }
+
+        #[cfg(hashes_fuzz)]
+        fn input(&mut self, inp: &[u8]) {
+            for c in inp {
+                self.buffer[0] ^= *c;
+            }
+            self.bytes_hashed += inp.len() as u64;
+        }
+    };
+}
+pub(crate) use impl_engine_input;

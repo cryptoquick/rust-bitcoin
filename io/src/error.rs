@@ -1,32 +1,47 @@
-#[cfg(all(not(feature = "std"), feature = "alloc"))]
+// SPDX-License-Identifier: CC0-1.0
+
+//! Error types for the `io` crate.
+
+#[cfg(feature = "alloc")]
+#[cfg(not(feature = "std"))]
 use alloc::boxed::Box;
-use core::fmt::{Debug, Display, Formatter};
+use core::fmt;
+#[cfg(feature = "std")]
+use std::boxed::Box;
 
 /// The `io` crate error type.
 #[derive(Debug)]
 pub struct Error {
     kind: ErrorKind,
+    /// We want this type to be `?UnwindSafe` and `?RefUnwindSafe` - the same as `std::io::Error`.
+    ///
+    /// In `std` builds the existence of `dyn std::error:Error` prevents `UnwindSafe` and
+    /// `RefUnwindSafe` from being automatically implemented. But in `no-std` builds without the
+    /// marker nothing prevents it.
+    _not_unwind_safe: core::marker::PhantomData<NotUnwindSafe>,
 
     #[cfg(feature = "std")]
     error: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
-    #[cfg(all(feature = "alloc", not(feature = "std")))]
-    error: Option<Box<dyn Debug + Send + Sync + 'static>>,
+    #[cfg(feature = "alloc")]
+    #[cfg(not(feature = "std"))]
+    error: Option<Box<dyn fmt::Debug + Send + Sync + 'static>>,
 }
 
 impl Error {
-    /// Creates a new I/O error.
+    /// Constructs a new I/O error.
     #[cfg(feature = "std")]
-    pub fn new<E>(kind: ErrorKind, error: E) -> Error
+    pub fn new<E>(kind: ErrorKind, error: E) -> Self
     where
         E: Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
     {
-        Self { kind, error: Some(error.into()) }
+        Self { kind, _not_unwind_safe: core::marker::PhantomData, error: Some(error.into()) }
     }
 
-    /// Creates a new I/O error.
-    #[cfg(all(feature = "alloc", not(feature = "std")))]
-    pub fn new<E: sealed::IntoBoxDynDebug>(kind: ErrorKind, error: E) -> Error {
-        Self { kind, error: Some(error.into()) }
+    /// Constructs a new I/O error.
+    #[cfg(feature = "alloc")]
+    #[cfg(not(feature = "std"))]
+    pub fn new<E: sealed::IntoBoxDynDebug>(kind: ErrorKind, error: E) -> Self {
+        Self { kind, _not_unwind_safe: core::marker::PhantomData, error: Some(error.into()) }
     }
 
     /// Returns the error kind for this error.
@@ -39,22 +54,26 @@ impl Error {
     }
 
     /// Returns a reference to this error.
-    #[cfg(all(feature = "alloc", not(feature = "std")))]
-    pub fn get_ref(&self) -> Option<&(dyn Debug + Send + Sync + 'static)> { self.error.as_deref() }
+    #[cfg(feature = "alloc")]
+    #[cfg(not(feature = "std"))]
+    pub fn get_ref(&self) -> Option<&(dyn fmt::Debug + Send + Sync + 'static)> {
+        self.error.as_deref()
+    }
 }
 
 impl From<ErrorKind> for Error {
-    fn from(kind: ErrorKind) -> Error {
+    fn from(kind: ErrorKind) -> Self {
         Self {
             kind,
+            _not_unwind_safe: core::marker::PhantomData,
             #[cfg(any(feature = "std", feature = "alloc"))]
             error: None,
         }
     }
 }
 
-impl Display for Error {
-    fn fmt(&self, fmt: &mut Formatter) -> core::result::Result<(), core::fmt::Error> {
+impl fmt::Display for Error {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         fmt.write_fmt(format_args!("I/O Error: {}", self.kind.description()))?;
         #[cfg(any(feature = "alloc", feature = "std"))]
         if let Some(e) = &self.error {
@@ -69,38 +88,36 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         self.error.as_ref().and_then(|e| e.as_ref().source())
     }
-
-    #[allow(deprecated)]
-    fn description(&self) -> &str {
-        match self.error.as_ref() {
-            Some(e) => e.description(),
-            None => self.kind.description(),
-        }
-    }
-
-    #[allow(deprecated)]
-    fn cause(&self) -> Option<&dyn std::error::Error> {
-        self.error.as_ref().and_then(|e| e.as_ref().cause())
-    }
 }
 
 #[cfg(feature = "std")]
 impl From<std::io::Error> for Error {
-    fn from(o: std::io::Error) -> Error {
-        Self { kind: ErrorKind::from_std(o.kind()), error: o.into_inner() }
+    fn from(o: std::io::Error) -> Self {
+        Self {
+            kind: ErrorKind::from_std(o.kind()),
+            _not_unwind_safe: core::marker::PhantomData,
+            error: o.into_inner(),
+        }
     }
 }
 
 #[cfg(feature = "std")]
 impl From<Error> for std::io::Error {
-    fn from(o: Error) -> std::io::Error {
+    fn from(o: Error) -> Self {
         if let Some(err) = o.error {
-            std::io::Error::new(o.kind.to_std(), err)
+            Self::new(o.kind.to_std(), err)
         } else {
             o.kind.to_std().into()
         }
     }
 }
+
+/// Useful for preventing `UnwindSafe` and `RefUnwindSafe` from being automatically implemented.
+struct NotUnwindSafe {
+    _not_unwind_safe: core::marker::PhantomData<(&'static mut (), core::cell::UnsafeCell<()>)>,
+}
+
+unsafe impl Sync for NotUnwindSafe {}
 
 macro_rules! define_errorkind {
     ($($(#[$($attr:tt)*])* $kind:ident),*) => {
@@ -179,28 +196,67 @@ define_errorkind!(
     WriteZero,
     /// This operation was interrupted.
     Interrupted,
-    /// An error returned when an operation could not be completed because an “end of file” was reached prematurely.
+    /// An error returned when an operation could not be completed because an "end of file" was reached prematurely.
     UnexpectedEof,
     // Note: Any time we bump the MSRV any new error kinds should be added here!
     /// A custom error that does not fall under any other I/O error kind
     Other
 );
 
-#[cfg(all(feature = "alloc", not(feature = "std")))]
+/// An error that can occur when reading and decoding from a buffered reader.
+#[derive(Debug)]
+pub enum ReadError<D> {
+    /// An I/O error occurred while reading from the reader.
+    Io(Error),
+    /// The decoder encountered an error while parsing the data.
+    Decode(D),
+}
+
+impl<D: fmt::Display> fmt::Display for ReadError<D> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "I/O error: {}", e),
+            Self::Decode(e) => write!(f, "decode error: {}", e),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl<D> std::error::Error for ReadError<D>
+where
+    D: fmt::Debug + fmt::Display + std::error::Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(e) => Some(e),
+            Self::Decode(e) => Some(e),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl<D> From<Error> for ReadError<D> {
+    fn from(e: Error) -> Self { Self::Io(e) }
+}
+
+#[cfg(feature = "alloc")]
+#[cfg(not(feature = "std"))]
 mod sealed {
     use alloc::boxed::Box;
     use alloc::string::String;
-    use core::fmt::Debug;
+    use core::fmt;
 
     pub trait IntoBoxDynDebug {
-        fn into(self) -> Box<dyn Debug + Send + Sync + 'static>;
+        fn into(self) -> Box<dyn fmt::Debug + Send + Sync + 'static>;
     }
 
     impl IntoBoxDynDebug for &str {
-        fn into(self) -> Box<dyn Debug + Send + Sync + 'static> { Box::new(String::from(self)) }
+        fn into(self) -> Box<dyn fmt::Debug + Send + Sync + 'static> {
+            Box::new(String::from(self))
+        }
     }
 
     impl IntoBoxDynDebug for String {
-        fn into(self) -> Box<dyn Debug + Send + Sync + 'static> { Box::new(self) }
+        fn into(self) -> Box<dyn fmt::Debug + Send + Sync + 'static> { Box::new(self) }
     }
 }

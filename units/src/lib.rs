@@ -1,68 +1,79 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! Rust Bitcoin units library
+//! # Rust Bitcoin Unit Types
 //!
 //! This library provides basic types used by the Rust Bitcoin ecosystem.
+//!
+//! If you are using `rust-bitcoin` then you do not need to access this crate directly. Everything
+//! here is re-exported in `rust-bitcoin` at the same path. Also the same re-exports exist in
+//! `primitives` if you are using that crate instead of `bitcoin`.
+//!
+//! # Examples
+//!
+//! ```
+//! // Exactly the same as `use bitcoin::{amount, Amount}`.
+//! use bitcoin_units::{amount, Amount};
+//!
+//! let _amount = Amount::from_sat(1_000)?;
+//! # Ok::<_, amount::OutOfRangeError>(())
+//! ```
 
-// Experimental features we need.
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![no_std]
 // Coding conventions.
 #![warn(missing_docs)]
-// Exclude lints we don't think are valuable.
-#![allow(clippy::needless_question_mark)] // https://github.com/rust-bitcoin/rust-bitcoin/pull/2134
-#![allow(clippy::manual_range_contains)] // More readable than clippy's format.
-#![allow(clippy::needless_borrows_for_generic_args)] // https://github.com/rust-lang/rust-clippy/issues/12454
-#![no_std]
-
-// Disable 16-bit support at least for now as we can't guarantee it yet.
-#[cfg(target_pointer_width = "16")]
-compile_error!(
-    "rust-bitcoin currently only supports architectures with pointers wider than 16 bits, let us
-    know if you want 16-bit support. Note that we do NOT guarantee that we will implement it!"
-);
+#![warn(deprecated_in_future)]
+#![doc(test(attr(warn(unused))))]
+// Extra restriction lints.
+#![warn(clippy::indexing_slicing)] // Avoid implicit panics from indexing/slicing.
 
 #[cfg(feature = "alloc")]
 extern crate alloc;
-
 #[cfg(feature = "std")]
 extern crate std;
 
-/// A generic serialization/deserialization framework.
+#[cfg(feature = "arbitrary")]
+pub extern crate arbitrary;
+#[cfg(feature = "encoding")]
+pub extern crate encoding;
 #[cfg(feature = "serde")]
 pub extern crate serde;
 
-#[cfg(test)]
-#[macro_use]
-mod test_macros;
+#[doc(hidden)]
+pub mod _export {
+    /// A re-export of `core::*`.
+    pub mod _core {
+        pub use core::*;
+    }
+}
+
+mod fee;
+mod internal_macros;
 
 pub mod amount;
-#[cfg(feature = "alloc")]
+pub mod block;
 pub mod fee_rate;
-#[cfg(feature = "alloc")]
 pub mod locktime;
-#[cfg(feature = "alloc")]
-pub mod parse;
-#[cfg(feature = "alloc")]
+pub mod parse_int;
+pub mod pow;
+pub mod result;
+pub mod sequence;
+pub mod time;
 pub mod weight;
 
 #[doc(inline)]
-pub use self::amount::{Amount, SignedAmount};
-pub use self::amount::ParseAmountError;
-#[cfg(feature = "alloc")]
-pub use self::parse::ParseIntError;
-#[cfg(feature = "alloc")]
-#[doc(inline)]
+#[rustfmt::skip]
 pub use self::{
+    amount::{Amount, SignedAmount},
+    block::{BlockHeight, BlockHeightInterval, BlockMtp, BlockMtpInterval},
     fee_rate::FeeRate,
-    weight::Weight,
+    locktime::{absolute, relative},
+    pow::{CompactTarget, Target, Work},
+    result::NumOpResult,
+    sequence::Sequence,
+    time::BlockTime,
+    weight::Weight
 };
 
-#[rustfmt::skip]
-#[allow(unused_imports)]
-mod prelude {
-    #[cfg(all(feature = "alloc", not(feature = "std")))]
-    pub use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::{Borrow, BorrowMut, Cow, ToOwned}, slice, rc};
-
-    #[cfg(feature = "std")]
-    pub use std::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::{Borrow, BorrowMut, Cow, ToOwned}, rc};
-}
+// decoder_newtype! macro
+#[cfg(feature = "encoding")]
+include!("../include/decoder_newtype.rs");

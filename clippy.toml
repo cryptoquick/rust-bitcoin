@@ -1,2 +1,3 @@
-msrv = "1.56.1"
-too-many-arguments-threshold = 13
+# Clippy config for `rust-bitcoin`.
+
+doc-valid-idents = ["SegWit", "OpenSSL"]

@@ -1,0 +1,115 @@
+[package]
+name = "bitcoin-benches"
+version = "0.1.0"
+license = "CC0-1.0"
+description = "Criterion benchmarks for rust-bitcoin"
+edition = "2021"
+
+[dependencies]
+bitcoin = { package = "bitcoin-p2mr-pqc", path = "../bitcoin", default-features = false, features = ["std"] }
+bitcoin_hashes = { path = "../hashes" }
+chacha20-poly1305 = { path = "../chacha20_poly1305" }
+encoding = { package = "bitcoin-consensus-encoding", path = "../consensus_encoding" }
+
+criterion = "0.7"
+hex = { package = "hex-conservative", version = "1.1.0" }
+
+[lints.clippy]
+use_self = "warn"
+
+[[bench]]
+name = "block"
+path = "bitcoin/block.rs"
+harness = false
+
+[[bench]]
+name = "transaction"
+path = "bitcoin/transaction.rs"
+harness = false
+
+[[bench]]
+name = "witness"
+path = "bitcoin/witness.rs"
+harness = false
+
+[[bench]]
+name = "duplicate_inputs"
+path = "bitcoin/duplicate_inputs.rs"
+harness = false
+
+[[bench]]
+name = "merkle_tree"
+path = "bitcoin/merkle_tree.rs"
+harness = false
+
+
+[[bench]]
+name = "chacha20poly1305"
+path = "chacha20_poly1305/chacha20poly1305.rs"
+harness = false
+
+[[bench]]
+name = "chacha20"
+path = "chacha20_poly1305/chacha20.rs"
+harness = false
+
+
+[[bench]]
+name = "cmp"
+path = "hashes/cmp.rs"
+harness = false
+
+[[bench]]
+name = "hash160"
+path = "hashes/hash160.rs"
+harness = false
+
+[[bench]]
+name = "hmac"
+path = "hashes/hmac.rs"
+harness = false
+
+[[bench]]
+name = "ripemd160"
+path = "hashes/ripemd160.rs"
+harness = false
+
+[[bench]]
+name = "sha1"
+path = "hashes/sha1.rs"
+harness = false
+
+[[bench]]
+name = "sha3_256"
+path = "hashes/sha3_256.rs"
+harness = false
+
+[[bench]]
+name = "sha256"
+path = "hashes/sha256.rs"
+harness = false
+
+[[bench]]
+name = "sha256d"
+path = "hashes/sha256d.rs"
+harness = false
+
+[[bench]]
+name = "sha384"
+path = "hashes/sha384.rs"
+harness = false
+
+[[bench]]
+name = "sha512_256"
+path = "hashes/sha512_256.rs"
+harness = false
+
+[[bench]]
+name = "sha512"
+path = "hashes/sha512.rs"
+harness = false
+
+[[bench]]
+name = "siphash24"
+path = "hashes/siphash24.rs"
+harness = false

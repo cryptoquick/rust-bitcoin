@@ -68,6 +68,10 @@ impl InputString {
     ///     }
     /// }
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the write to the formatter fails.
     pub fn unknown_variant<T>(&self, what: &T, f: &mut fmt::Formatter) -> fmt::Result
     where
         T: fmt::Display + ?Sized,
@@ -95,14 +99,14 @@ impl_from!(&str);
 ///
 /// This is created by `display_cannot_parse` method and should be used as
 /// `write_err!("{}", self.input.display_cannot_parse("what is parsed"); self.source)` in parse
-/// error [`Display`](fmt::Display) imlementation if the error has source. If the error doesn't
+/// error [`Display`](fmt::Display) implementation if the error has source. If the error doesn't
 /// have a source just use regular `write!` with same formatting arguments.
 pub struct CannotParse<'a, T: fmt::Display + ?Sized> {
     input: &'a InputString,
     what: &'a T,
 }
 
-impl<'a, T: fmt::Display + ?Sized> fmt::Display for CannotParse<'a, T> {
+impl<T: fmt::Display + ?Sized> fmt::Display for CannotParse<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         storage::cannot_parse(&self.input.0, &self.what, f)
     }
@@ -122,7 +126,7 @@ mod storage {
     }
 
     impl From<&str> for Storage {
-        fn from(_value: &str) -> Self { Storage }
+        fn from(_value: &str) -> Self { Self }
     }
 
     pub(super) fn cannot_parse<W>(_: &Storage, what: &W, f: &mut fmt::Formatter) -> fmt::Result

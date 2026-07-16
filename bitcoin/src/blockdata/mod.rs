@@ -4,11 +4,9 @@
 //!
 //! This module defines structures and functions for storing the blocks and
 //! transactions which make up the Bitcoin system.
-//!
 
 pub mod block;
 pub mod constants;
-pub mod locktime;
 pub mod opcodes;
 pub mod script;
 pub mod transaction;
@@ -21,36 +19,70 @@ pub use self::{
     weight::Weight
 };
 
-/// Implements `FeeRate` and assoctiated features.
+/// Implements `FeeRate` and associated features.
 pub mod fee_rate {
-    /// Re-export everything from the [`units::fee_rate`] module.
-    pub use units::fee_rate::*;
+    #[cfg(feature = "serde")]
+    #[doc(inline)]
+    pub use units::fee_rate::serde;
+    // Re-export everything from the [`units::fee_rate`] module.
+    #[doc(inline)]
+    pub use units::fee_rate::FeeRate;
+}
 
-    #[cfg(test)]
-    mod tests {
-        use super::*;
+/// Provides absolute and relative locktimes.
+pub mod locktime {
+    pub mod absolute {
+        //! Provides type [`LockTime`] that implements the logic around nLockTime/OP_CHECKLOCKTIMEVERIFY.
+        //!
+        //! There are two types of lock time: lock-by-height and lock-by-time, distinguished by
+        //! whether `LockTime < LOCKTIME_THRESHOLD`.
 
-        #[test]
-        fn fee_convenience_functions_agree() {
-            use hex::test_hex_unwrap as hex;
+        // Re-export everything from the `units::locktime::absolute` module.
+        #[rustfmt::skip]        // Keep public re-exports separate.
+        #[doc(inline)]
+        pub use units::locktime::absolute::{
+            error, Height, LockTime, LockTimeDecoder, LockTimeEncoder, MedianTimePast
+        };
+        #[doc(no_inline)]
+        pub use units::locktime::absolute::{
+            ConversionError, IncompatibleHeightError, IncompatibleTimeError, LockTimeDecoderError,
+            ParseHeightError, ParseTimeError,
+        };
 
-            use crate::blockdata::transaction::Transaction;
-            use crate::consensus::Decodable;
+        #[deprecated(since = "TBD", note = "use `MedianTimePast` instead")]
+        #[doc(hidden)]
+        pub type Time = MedianTimePast;
+    }
 
-            const SOME_TX: &str = "0100000001a15d57094aa7a21a28cb20b59aab8fc7d1149a3bdbcddba9c622e4f5f6a99ece010000006c493046022100f93bb0e7d8db7bd46e40132d1f8242026e045f03a0efe71bbb8e3f475e970d790221009337cd7f1f929f00cc6ff01f03729b069a7c21b59b1736ddfee5db5946c5da8c0121033b9b137ee87d5a812d6f506efdd37f0affa7ffc310711c06c7f3e097c9447c52ffffffff0100e1f505000000001976a9140389035a9225b3839e2bbf32d826a1e222031fd888ac00000000";
+    pub mod relative {
+        //! Provides type [`LockTime`] that implements the logic around nSequence/OP_CHECKSEQUENCEVERIFY.
+        //!
+        //! There are two types of lock time: lock-by-height and lock-by-time, distinguished by
+        //! whether bit 22 of the `u32` consensus value is set.
 
-            let raw_tx = hex!(SOME_TX);
-            let tx: Transaction = Decodable::consensus_decode(&mut raw_tx.as_slice()).unwrap();
+        // Re-export everything from the `units::locktime::relative` module.
+        #[doc(inline)]
+        pub use units::locktime::relative::{error, LockTime, NumberOf512Seconds, NumberOfBlocks};
+        #[doc(no_inline)]
+        pub use units::locktime::relative::{
+            DisabledLockTimeError, IncompatibleHeightError, IncompatibleTimeError,
+            InvalidHeightError, InvalidTimeError, IsSatisfiedByError, IsSatisfiedByHeightError,
+            IsSatisfiedByTimeError, TimeOverflowError,
+        };
 
-            let rate = FeeRate::from_sat_per_vb(1).expect("1 sat/byte is valid");
+        #[deprecated(since = "TBD", note = "use `NumberOfBlocks` instead")]
+        #[doc(hidden)]
+        pub type Height = NumberOfBlocks;
 
-            assert_eq!(rate.fee_vb(tx.vsize() as u64), rate.fee_wu(tx.weight()));
-        }
+        #[deprecated(since = "TBD", note = "use `NumberOf512Seconds` instead")]
+        #[doc(hidden)]
+        pub type Time = NumberOf512Seconds;
     }
 }
 
 /// Implements `Weight` and associated features.
 pub mod weight {
-    /// Re-export everything from the [`units::weight`] module.
-    pub use units::weight::*;
+    // Re-export everything from the [`units::weight`] module.
+    #[doc(inline)]
+    pub use units::weight::Weight;
 }

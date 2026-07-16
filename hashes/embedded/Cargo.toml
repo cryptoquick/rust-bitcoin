@@ -11,15 +11,18 @@ members = ["."]
 
 [features]
 alloc = ["alloc-cortex-m", "bitcoin_hashes/alloc"]
+hex = ["bitcoin_hashes/hex"]
 
 [dependencies]
-cortex-m = "0.6.0"
 cortex-m-rt = "0.6.10"
 cortex-m-semihosting = "0.3.3"
 panic-halt = "0.2.0"
 alloc-cortex-m = { version = "0.4.1", optional = true }
-bitcoin_hashes = { path="../", default-features = false, features = ["io"] }
-bitcoin-io = { path = "../../io", default_features = false }
+bitcoin_hashes = { path="../", default-features = false, features = [] }
+bitcoin-io = { path = "../../io", default_features = false, features = ["hashes"] }
+
+[lints.clippy]
+use_self = "warn"
 
 [[bin]]
 name = "embedded"
@@ -31,11 +34,5 @@ codegen-units = 1 # better optimizations
 debug = true # symbols are nice and they don't increase the size on Flash
 lto = true # better optimizations
 
-[patch.crates-io.bitcoin-internals]
-path = "../../internals"
-
-[patch.crates-io.bitcoin-io]
-path = "../../io"
-
-[patch.crates-io.bitcoin-units]
-path = "../../units"
+[patch.crates-io.bitcoin_hashes]
+path = "../../hashes"

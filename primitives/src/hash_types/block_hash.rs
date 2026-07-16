@@ -1,0 +1,114 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! The `BlockHash` type.
+
+use core::convert::Infallible;
+use core::fmt;
+#[cfg(feature = "hex")]
+use core::str;
+
+#[cfg(feature = "arbitrary")]
+use arbitrary::{Arbitrary, Unstructured};
+use hashes::sha256d;
+use internals::write_err;
+
+/// A bitcoin block hash.
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BlockHash(sha256d::Hash);
+
+super::impl_debug!(BlockHash);
+
+impl BlockHash {
+    /// Dummy hash used as the previous blockhash of the genesis block.
+    pub const GENESIS_PREVIOUS_BLOCK_HASH: Self = Self::from_byte_array([0; 32]);
+}
+
+// The new hash wrapper type.
+type HashType = BlockHash;
+// The inner hash type from `hashes`.
+type Inner = sha256d::Hash;
+
+include!("./generic.rs");
+
+impl encoding::Encode for BlockHash {
+    type Encoder<'e> = BlockHashEncoder<'e>;
+    #[inline]
+    fn encoder(&self) -> Self::Encoder<'_> {
+        BlockHashEncoder::new(encoding::ArrayRefEncoder::without_length_prefix(
+            self.as_byte_array(),
+        ))
+    }
+}
+
+impl encoding::Decode for BlockHash {
+    type Decoder = BlockHashDecoder;
+}
+
+encoding::encoder_newtype_exact! {
+    /// The encoder for the [`BlockHash`] type.
+    #[derive(Debug, Clone)]
+    pub struct BlockHashEncoder<'e>(encoding::ArrayRefEncoder<'e, 32>);
+}
+
+crate::decoder_newtype! {
+    /// The decoder for the [`BlockHash`] type.
+    #[derive(Debug, Clone)]
+    pub struct BlockHashDecoder(encoding::ArrayDecoder<32>);
+
+    /// Constructs a new [`BlockHash`] decoder.
+    pub const fn new() -> Self { Self(encoding::ArrayDecoder::new()) }
+
+    fn end(result: Result<[u8; 32], encoding::UnexpectedEofError>) -> Result<BlockHash, BlockHashDecoderError> {
+        let bytes = result.map_err(BlockHashDecoderError)?;
+        Ok(BlockHash::from_byte_array(bytes))
+    }
+}
+
+/// An error consensus decoding a `BlockHash`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockHashDecoderError(encoding::UnexpectedEofError);
+
+impl From<Infallible> for BlockHashDecoderError {
+    fn from(never: Infallible) -> Self { match never {} }
+}
+
+impl fmt::Display for BlockHashDecoderError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write_err!(f, "block hash decoder error"; self.0)
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for BlockHashDecoderError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
+}
+
+#[cfg(test)]
+mod tests {
+    use encoding::Decoder as _;
+
+    use super::*;
+
+    #[test]
+    fn decoder_full_read_limit() {
+        assert_eq!(BlockHashDecoder::default().read_limit(), 32);
+        assert_eq!(<BlockHash as encoding::Decode>::decoder().read_limit(), 32);
+    }
+
+    #[test]
+    #[cfg(feature = "std")]
+    fn decoder_error_display() {
+        use std::error::Error as _;
+        use std::string::ToString as _;
+
+        let mut decoder = BlockHashDecoder::new();
+        let mut bytes = &[0u8; 31][..];
+
+        assert!(decoder.push_bytes(&mut bytes).unwrap().needs_more());
+
+        let err = decoder.end().unwrap_err();
+
+        assert!(!err.to_string().is_empty());
+        assert!(err.source().is_some());
+    }
+}

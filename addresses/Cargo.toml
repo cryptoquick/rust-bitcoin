@@ -1,0 +1,34 @@
+[package]
+name = "bitcoin-addresses"
+version = "0.0.0"
+authors = ["Andrew Poelstra <apoelstra@wpsoftware.net>"]
+license = "CC0-1.0"
+repository = "https://github.com/rust-bitcoin/rust-bitcoin"
+homepage = "https://rust-bitcoin.org"
+description = "Bitcoin address"
+categories = ["cryptography::cryptocurrencies"]
+keywords = ["bitcoin", "types"]
+readme = "README.md"
+edition = "2021"
+rust-version = "1.74.0"
+exclude = ["tests", "contrib"]
+
+[features]
+default = ["std"]
+std = ["alloc", "crypto/std", "internals/std", "primitives/std", "taproot_primitives/std"]
+alloc = ["crypto/alloc", "internals/alloc", "primitives/alloc", "taproot_primitives/alloc"]
+
+[dependencies]
+crypto = { package = "bitcoin-crypto", path = "../crypto", version = "0.2.0", default-features = false, features = [] }
+internals = { package = "bitcoin-internals", path = "../internals", version = "0.6.0" }
+taproot_primitives = { package = "bitcoin-taproot-primitives", path = "../taproot-primitives", version = "0.1.0", default-features = false, features = [] }
+primitives = { package = "bitcoin-primitives", path = "../primitives", version = "0.102.0", default-features = false, features = ["hex"] }
+
+[dev-dependencies]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true

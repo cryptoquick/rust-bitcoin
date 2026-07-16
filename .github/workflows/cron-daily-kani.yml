@@ -3,12 +3,22 @@ name: Kani CI
 on:
   schedule:
     - cron: '59 23 * * *'       # midnight every day.
+permissions: {}
 jobs:
   run-kani:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        # Run on master as well as LTS branches.
+        branch: [master, 0.32.xxx, 0.32.xx]
     steps:
       - name: 'Checkout your code.'
-        uses: actions/checkout@v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ matrix.branch }}
+          persist-credentials: false
 
       - name: 'Run Kani on your code.'
-        uses: model-checking/kani-github-action@v1.1
+        uses: model-checking/kani-github-action@f838096619a707b0f6b2118cf435eaccfa33e51f # v1.1
